@@ -1,0 +1,34 @@
+{
+  "name": "emavanta-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node --watch apps/api/src/server.js",
+    "start": "node apps/api/src/server.js",
+    "workers": "node apps/workers/index.js",
+    "db:check": "node scripts/db-check.js",
+    "smtp:check": "node scripts/smtp-check.js",
+    "bsc:check": "node scripts/bsc-check.js",
+    "test": "node --test tests/*.test.js",
+    "payments:check": "node scripts/payments-check.js",
+    "redis:check": "node scripts/upstash-check.js",
+    "demo:cleanup": "node scripts/demo-cleanup.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.2",
+    "argon2": "^0.41.1",
+    "ethers": "^6.17.0",
+    "fastify": "^5.2.2",
+    "fastify-plugin": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.20.0",
+    "nodemailer": "10.6.1",
+    "qrcode": "^1.5.4",
+    "stripe": "^17.7.0",
+    "zod": "4.6.7"
+  }
+}
