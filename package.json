@@ -7,8 +7,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "node apps/api/src/server.js",
-    "start": "node apps/api/src/server.js",
+    "dev": "node server.js",
+    "start": "node server.js",
     "workers": "node apps/workers/index.js",
     "db:check": "node scripts/db-check.js",
     "smtp:check": "node scripts/smtp-check.js",

@@ -1,14 +1,14 @@
-import './env.js'; // must stay first: loads .env before anything reads process.env
+import './apps/api/src/env.js'; // must stay first: loads .env before anything reads process.env
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import { config } from './config.js';
-import { contextPlugin } from './plugins/context.js';
-import { errorPlugin } from './plugins/errors.js';
-import { installJsonParser } from './plugins/json-body.js';
-import { connectDB, disconnectDB } from '../../../packages/database/store.js';
-import { startWorkers } from './workers/index.js';
-import { startSchedulerSweep } from './workers/schedulerSweep.js';
-import { closeQueues, getQueue } from '../../../packages/queue/index.js';
+import { config } from './apps/api/src/config.js';
+import { contextPlugin } from './apps/api/src/plugins/context.js';
+import { errorPlugin } from './apps/api/src/plugins/errors.js';
+import { installJsonParser } from './apps/api/src/plugins/json-body.js';
+import { connectDB, disconnectDB } from './packages/database/store.js';
+import { startWorkers } from './apps/api/src/workers/index.js';
+import { startSchedulerSweep } from './apps/api/src/workers/schedulerSweep.js';
+import { closeQueues, getQueue } from './packages/queue/index.js';
 
 // Trust only explicitly configured reverse-proxy addresses/CIDRs; never trust arbitrary X-Forwarded-For.
 const trustedProxy=String(process.env.TRUSTED_PROXY_IPS||'').split(',').map(x=>x.trim()).filter(Boolean);
@@ -22,36 +22,36 @@ await app.register(errorPlugin);
 await app.register(contextPlugin);
 
 const routes = [
-  ['/api/v1', (await import('./routes/health.js')).default],
-  ['/api/v1', (await import('./routes/auth.js')).default],
-  ['/api/v1', (await import('./routes/organizations.js')).default],
-  ['/api/v1', (await import('./routes/team.js')).default],
-  ['/api/v1', (await import('./routes/contacts.js')).default],
-  ['/api/v1', (await import('./routes/templates.js')).default],
-  ['/api/v1', (await import('./routes/accounts.js')).default],
-  ['/api/v1', (await import('./routes/campaigns.js')).default],
-  ['/api/v1', (await import('./routes/sequences.js')).default],
-  ['/api/v1', (await import('./routes/analytics.js')).default],
-  ['/api/v1', (await import('./routes/billing.js')).default],
-  ['/api/v1', (await import('./routes/crypto.js')).default],
-  ['/api/v1', (await import('./routes/stripe-elements.js')).default],
-  ['/api/v1', (await import('./routes/admin.js')).default],
-  ['/api/v1', (await import('./routes/webhooks.js')).default],
-  ['/api/v1', (await import('./routes/advanced.js')).default],
-  ['/api/v1', (await import('./routes/advanced2.js')).default],
-  ['/api/v1', (await import('./routes/advanced3.js')).default],
-  ['/api/v1', (await import('./routes/advanced4.js')).default],
-  ['/api/v1', (await import('./routes/forms.js')).default]
+  ['/api/v1', (await import('./apps/api/src/routes/health.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/auth.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/organizations.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/team.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/contacts.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/templates.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/accounts.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/campaigns.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/sequences.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/analytics.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/billing.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/crypto.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/stripe-elements.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/admin.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/webhooks.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/advanced.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/advanced2.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/advanced3.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/advanced4.js')).default],
+  ['/api/v1', (await import('./apps/api/src/routes/forms.js')).default]
 ];
 for (const [prefix, plugin] of routes) await app.register(plugin, { prefix });
-await app.register((await import('./routes/tracking.js')).default);
+await app.register((await import('./apps/api/src/routes/tracking.js')).default);
 
 const dbState = await connectDB().catch(err => {
   console.error(`\n[api] startup aborted — ${err.message}\n`);
   process.exit(1);
 });
 console.log(`[api] storage: ${dbState.mode}${dbState.database ? ` · ${dbState.database}` : ''}`);
-if (config.demo) { const { seedDemoData } = await import('./seed.js'); await seedDemoData(); }
+if (config.demo) { const { seedDemoData } = await import('./apps/api/src/seed.js'); await seedDemoData(); }
 const embeddedWorkers=process.env.RUN_EMBEDDED_WORKERS!=='false';
 if(embeddedWorkers)startWorkers();
 const stopSchedulerSweep=embeddedWorkers?startSchedulerSweep():async()=>{};
