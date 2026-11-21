@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "node --watch apps/api/src/server.js",
+    "dev": "node apps/api/src/server.js",
     "start": "node apps/api/src/server.js",
     "workers": "node apps/workers/index.js",
     "db:check": "node scripts/db-check.js",
