@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "node --watch server.js",
+    "dev": "node server.js",
     "start": "node server.js",
     "workers": "node apps/workers/index.js",
     "db:check": "node scripts/db-check.js",
