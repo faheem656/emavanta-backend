@@ -16,7 +16,7 @@ for i,key in ipairs(KEYS) do
  local tokens=tonumber(state[1]) or cap; local last=tonumber(state[2]) or now
  tokens=math.min(cap,tokens+math.max(0,now-last)*refill/1000)
  if mode=='take' and tokens<qty then
-  local retry=math.ceil((qty-tokens)/math.max(refill,0.01))
+  local retry=refill>0 and math.ceil((qty-tokens)/refill) or 3600
   return {0,i,retry,math.floor(tokens)}
  end
  if mode=='take' then tokens=tokens-qty else tokens=math.min(cap,tokens+qty) end

@@ -216,8 +216,7 @@ export default async function formRoutes(app) {
   });
 
   app.post('/public/forms/:slug/submit', async req => {
-    // Embedded forms are posted cross-origin by definition; @fastify/cors reflects the
-    // caller's origin for these public routes and answers the preflight.
+    // Public form CORS permits third-party sites without credentials; inputs are still validated.
     const form = await collection('forms').findOne({ slug: req.params.slug, deleted: { $ne: true } });
     if (!form) throw notFound('This form does not exist or was turned off');
     if (form.status === 'paused') throw badRequest('This form is not accepting responses right now');

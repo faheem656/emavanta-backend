@@ -128,7 +128,7 @@ export default async function billingRoutes(app) {
     const price = priceFor({ kind, plan, code, quantity, interval });
 
     const session = await collection('payment_sessions').create({
-      _id: newId(), organizationId: req.ctx.organizationId, kind,
+      _id: newId(), organizationId: req.ctx.organizationId, createdByUserId: req.ctx.user.id, kind,
       plan: kind === 'plan' ? plan : null, code: kind === 'addon' ? code : null,
       quantity: price.quantity || Number(quantity) || 1, interval: price.interval,
       amount: price.amount, currency: price.currency, description: price.description,

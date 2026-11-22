@@ -5,6 +5,7 @@ import { collection, isMemoryMode } from '../../../../packages/database/store.js
 import { expireCryptoSubscription } from '../payments/crypto-service.js';
 import { ROLES } from '../../../../packages/shared/constants.js';
 import { unauthorized } from '../../../../packages/shared/errors.js';
+import { sessionNotExpired } from '../../../../packages/security/session-validity.js';
 
 export const contextPlugin = fp(async app => {
   app.decorateRequest('ctx', null);
@@ -24,7 +25,7 @@ export const contextPlugin = fp(async app => {
           const session = await collection('sessions').findOne({ _id: payload.sid });
           // A signed-out session must answer 401 with a sentence the UI can show, not a
           // generic 500. Without this the client sees "Internal error" on every old tab.
-          if (!session || session.status !== 'active' || session.userId !== payload.sub || session.organizationId !== payload.org || (!Number.isFinite(Date.parse(session.expiresAt)) || Date.parse(session.expiresAt) <= Date.now())) {
+          if (!session || session.status !== 'active' || session.userId !== payload.sub || session.organizationId !== payload.org || !sessionNotExpired(session)) {
             throw unauthorized('This session has expired or was signed out. Sign in again.');
           }
         }

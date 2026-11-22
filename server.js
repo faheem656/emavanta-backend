@@ -5,16 +5,16 @@ import { config } from './apps/api/src/config.js';
 import { contextPlugin } from './apps/api/src/plugins/context.js';
 import { errorPlugin } from './apps/api/src/plugins/errors.js';
 import { installJsonParser } from './apps/api/src/plugins/json-body.js';
+import { allowedFrontendOrigins, corsDelegator } from './apps/api/src/plugins/cors-policy.js';
 import { connectDB, disconnectDB } from './packages/database/store.js';
 import { startWorkers } from './apps/api/src/workers/index.js';
 import { startSchedulerSweep } from './apps/api/src/workers/schedulerSweep.js';
 import { closeQueues, getQueue } from './packages/queue/index.js';
 
 // Trust only explicitly configured reverse-proxy addresses/CIDRs; never trust arbitrary X-Forwarded-For.
-async function start() {
 const trustedProxy=String(process.env.TRUSTED_PROXY_IPS||'').split(',').map(x=>x.trim()).filter(Boolean);
 const app = Fastify({ ...(trustedProxy.length?{trustProxy:trustedProxy}:{}), routerOptions: { maxParamLength: 2048 }, logger: { level: process.env.LOG_LEVEL || 'warn' }, requestIdHeader: 'x-request-id' });
-await app.register(cors, { origin: true, credentials: true });
+await app.register(cors, { delegator: corsDelegator(allowedFrontendOrigins()) });
 
 // Browsers/proxies sometimes send `content-type: application/json` with an empty body
 // (e.g. a bodyless DELETE). Treat that as {} instead of a 400 so the action still works.
@@ -81,9 +81,3 @@ const shutdown = async () => {
 };
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
-}
-
-start().catch(err => {
-  console.error('[api] startup failed:', err);
-  process.exit(1);
-});

@@ -30,9 +30,9 @@ async function mutate(spec, quantity, refunding=false) {
   }
   throw new Error('Rate limiter is busy; retry later');
 }
-export const acquire=async({keys=[],quantity=1,lane='standard'})=>{
+export const acquire=async({keys=[],quantity=1,lane='standard',driver:driverOverride})=>{
   if(!Number.isFinite(quantity)||quantity<=0)throw new Error('Invalid rate-limit quantity');
-  const driver=String(process.env.RATE_LIMIT_BACKEND||'mongo').trim().toLowerCase();
+  const driver=String(driverOverride || process.env.RATE_LIMIT_BACKEND||'mongo').trim().toLowerCase();
   if(!['mongo','upstash'].includes(driver))throw new Error('Invalid rate-limit backend');
   if(driver==='upstash'){
     const specs=keys.map(spec=>{

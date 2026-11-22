@@ -28,7 +28,16 @@ export default async function advancedRoutes(app) {
     // Do not trust forwarding headers unless the API is configured with specific trusted proxies.
     // Hash the address so it is not stored in contact records or rate-bucket keys.
     const ipHash=stableHash('contact-ip',String(req.ip||'unknown'));
-    const limit=await acquire({keys:[{organizationId:'public-contact',stream:'contact',accountId:ipHash,capacity:8,refillPerSec:8/3600}]});
+    const bucket={keys:[{organizationId:'public-contact',stream:'contact',accountId:ipHash,capacity:8,refillPerSec:8/3600}]};
+    let limit;
+    try { limit=await acquire(bucket); }
+    catch (error) {
+      // Contact messages may use the shared MongoDB limiter when Redis is down.
+      // This is bounded, not a bypass; sending paths continue to fail closed.
+      if (!['UPSTASH_UNAVAILABLE','UPSTASH_CONFIG'].includes(error?.code) || isMemoryMode()) throw error;
+      console.warn('[contact] Upstash unavailable; using the shared MongoDB contact limiter.');
+      limit=await acquire({...bucket,driver:'mongo'});
+    }
     if(!limit.ok)throw tooMany('Too many messages. Please try again later.');
     const id=newId(), now=new Date().toISOString();
     const result=await writeWithOutbox({organizationId:'platform-contact',docs:[{name:'contact_messages',doc:{_id:id,name,email,company,topic,message,deliveryStatus:'queued',createdAt:now}}],

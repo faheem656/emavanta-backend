@@ -1,5 +1,6 @@
 import { collection } from '../../../packages/database/store.js';
 import { forbidden } from '../../../packages/shared/errors.js';
+import { sessionNotExpired } from '../../../packages/security/session-validity.js';
 
 // Platform access is never derived from a tenant role, a request body, or an API key.
 // The configured owner must have a verified account and a valid signed-in session.
@@ -10,7 +11,7 @@ export async function platformOwnerAccess(ctx) {
   if (!email || !ctx?.user?.id || !ctx?.sessionId || ctx.demo || ctx.apiKeyId) return { owner: false, ready: false };
   const user = await collection('users').findOne({ _id: ctx.user.id });
   const session = await collection('sessions').findOne({ _id: ctx.sessionId, userId: ctx.user.id, organizationId: ctx.organizationId, status: 'active' });
-  if (!user || user.emailVerified !== true || String(user.email || '').trim().toLowerCase() !== email || !session || (!Number.isFinite(Date.parse(session.expiresAt)) || Date.parse(session.expiresAt) <= Date.now())) return { owner: false, ready: false };
+  if (!user || user.emailVerified !== true || String(user.email || '').trim().toLowerCase() !== email || !session || !sessionNotExpired(session)) return { owner: false, ready: false };
   return { owner: true, ready: user.mfaEnabled === true && session.mfaVerified === true };
 }
 export async function requirePlatformOwner(ctx) {

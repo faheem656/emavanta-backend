@@ -35,7 +35,7 @@ const startSession = async ({ req, user, role, orgId, membershipId, scopes = [],
   await collection('sessions').create({ _id: sid, sid, userId: user._id || user.id, organizationId: orgId,
     membershipId: membershipId || null, role, mfaVerified, familyId: sid, status: 'active', device: DEVICE(req.headers['user-agent']),
     userAgent: req.headers['user-agent'] || 'unknown', ip: req.ip || 'local', createdAt: now, lastSeenAt: now,
-    expiresAt: new Date(Date.now() + 7 * 864e5).toISOString(), tokenHash: null });
+    persistent: true, expiresAt: null, tokenHash: null });
   return sid;
 };
 

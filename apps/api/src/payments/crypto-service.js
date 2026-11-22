@@ -120,7 +120,7 @@ export async function beginCryptoTransfer({organizationId,sessionId}) {
  return {ok:true};
 }
 
-export async function submitCrypto({organizationId, sessionId, txHash, signature}) {
+export async function submitCrypto({organizationId, sessionId, submittedByUserId, txHash, signature}) {
   await enabled();
   if(!/^0x[0-9a-f]{64}$/i.test(String(txHash||''))||!/^0x[0-9a-f]{130}$/i.test(String(signature||'')))throw badRequest('Provide a valid transaction hash and wallet signature.');
   txHash=txHash.toLowerCase();
@@ -146,7 +146,7 @@ export async function submitCrypto({organizationId, sessionId, txHash, signature
       if(!current)throw conflict('This order was already submitted.');
       const changed=await orders.updateOne({_id:sessionId,organizationId,status:'pending',cryptoNonce:order.cryptoNonce},{$set:{status:'crypto_submitted',cryptoTxHash:txHash,submittedAt:now}},{session});
       if(!changed.matchedCount)throw conflict('This order was already submitted.');
-      await database.collection('crypto_payments').insertOne({_id:txHash,orderId:sessionId,organizationId,kind:current.kind||'plan',plan:current.plan,code:current.code||null,quantity:current.quantity||1,interval:current.interval,
+      await database.collection('crypto_payments').insertOne({_id:txHash,orderId:sessionId,organizationId,createdByUserId:current.createdByUserId||null,submittedByUserId:submittedByUserId||null,kind:current.kind||'plan',plan:current.plan,code:current.code||null,quantity:current.quantity||1,interval:current.interval,
         amount:current.amount,recipient:current.cryptoRecipient,wallet:current.cryptoWallet,nonce:current.cryptoNonce,signature,
         notBefore:Math.floor(Date.parse(current.createdAt)/1000)-60,notAfter:Math.floor(Date.parse(current.expiresAt)/1000),
         expectedPlan:current.cryptoExpectedPlan,expectedExpiry:current.cryptoExpectedExpiry||null,expectedSource:current.cryptoExpectedSource||null,status:'pending',notificationStatus:'pending',...(current.cancelRequestedAt?{cancelRequestedAt:current.cancelRequestedAt}:{}),createdAt:now},{session});
@@ -159,8 +159,9 @@ export async function submitCrypto({organizationId, sessionId, txHash, signature
 export async function notifyOwner(txHash) {
   const db=nativeDatabase(), col=db.collection('crypto_payments'), payment=await col.findOne({_id:txHash});
   if(!payment)throw notFound('Payment not found.');
+  const [org,payer]=await Promise.all([db.collection('organizations').findOne({_id:payment.organizationId},{projection:{name:1}}), (payment.submittedByUserId||payment.createdByUserId)?db.collection('users').findOne({_id:payment.submittedByUserId||payment.createdByUserId},{projection:{name:1,email:1}}):null]);
   const delivery=await sendAuthMail({to:ownerEmail(),kind:'crypto owner notification',subject:'Emavanta crypto payment awaiting review',
-    text:`A USDT payment was submitted for review.\nOrder: ${payment.kind==='addon' ? `${payment.code} × ${payment.quantity}` : payment.plan}\nAmount: ${payment.amount} USDT\nTransaction: ${payment._id}\nOpen the owner dashboard to verify and review. Do not approve without verifying on chain.`});
+    text:`A USDT payment was submitted for review.\nWorkspace: ${org?.name||'Unknown'} (${payment.organizationId})\nUser: ${payer?.name||'Unknown'} (${payer?.email||'Unknown'}, ${payment.submittedByUserId||payment.createdByUserId||'unknown'})\nOrder: ${payment.kind==='addon' ? `${payment.code} × ${payment.quantity}` : payment.plan}\nAmount: ${payment.amount} USDT\nTransaction: ${payment._id}\nOpen the owner dashboard to verify and review. Do not approve without verifying on chain.`});
   const status=delivery.sent?'sent':'failed';
   await col.updateOne({_id:txHash},{$set:{notificationStatus:status,notificationAttemptedAt:new Date().toISOString()}});
   return {status};
@@ -259,7 +260,17 @@ export async function resolveRejectedCryptoLock({organizationId,orderId,ownerId,
 export async function listCrypto(organizationId){
   const query=organizationId?{organizationId}:{};
   const rows=await nativeDatabase().collection('crypto_payments').find(query,{projection:{signature:0,nonce:0}}).sort({createdAt:-1}).limit(100).toArray();
-  return rows.map(r=>({...r,txHash:r._id}));
+  if (organizationId) return rows.map(r=>({...r,txHash:r._id}));
+  // Owner-only review: show the identity captured when the order was created.
+  // Legacy orders may not have a creator; never infer or invent one.
+  const db=nativeDatabase();
+  return Promise.all(rows.map(async r=>{
+    const [org,user]=await Promise.all([
+      db.collection('organizations').findOne({_id:r.organizationId},{projection:{name:1}}),
+      (r.submittedByUserId||r.createdByUserId) ? db.collection('users').findOne({_id:r.submittedByUserId||r.createdByUserId},{projection:{name:1,email:1}}) : null
+    ]);
+    return {...r,txHash:r._id,workspaceName:org?.name||null,payer:(r.submittedByUserId||r.createdByUserId)?{id:r.submittedByUserId||r.createdByUserId,name:user?.name||null,email:user?.email||null}:null};
+  }));
 }
 
 export function addMonthsClamped(date,months) {

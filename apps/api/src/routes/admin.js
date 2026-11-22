@@ -2,6 +2,7 @@ import { config } from '../config.js';
 import { collection, dbInfo, isMemoryMode, withMongoTransaction, nativeDatabase } from '../../../../packages/database/store.js';
 import { validAddress } from '../payments/bsc.js';
 import { stripeReadiness } from '../payments/stripe-service.js';
+import { checkUpstash } from '../../../../packages/upstash/diagnostics.js';
 import { cryptoSetupDiagnostics, addMonthsClamped } from '../payments/crypto-service.js';
 import { smtpConfigured } from '../mail-auth.js';
 import { getQueue, queueReadiness } from '../../../../packages/queue/index.js';
@@ -46,9 +47,17 @@ export default async function adminRoutes(app) {
     const stripe = await stripeReadiness();
     return { database: { configured: db.driver === 'mongo', connected: db.driver === 'mongo' && db.connected },
       queue, smtp: { configured: smtpConfigured(), deliveryVerified: false },
+      contact: { ownerConfigured: /^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(String(process.env.PLATFORM_OWNER_EMAIL||'').trim()), workerEmbedded: process.env.RUN_EMBEDDED_WORKERS !== 'false', deliveryVerified:false },
+      redis: { driver:String(process.env.RATE_LIMIT_BACKEND||'mongo').trim().toLowerCase(), configured:!!String(process.env.UPSTASH_REDIS_REST_URL||'').trim() && !!String(process.env.UPSTASH_REDIS_REST_TOKEN||'').trim(), connectivityChecked:false },
       bsc: { addressConfigured: validAddress(process.env.BSC_USDT_RECEIVING_ADDRESS), rpcConfigured: !!String(process.env.BSC_RPC_URL || '').trim(), paymentsActive: crypto.available },
       stripe: {available:stripe.available},
       cryptoReview: { available: crypto.available, checks:crypto.checks, reason: crypto.available ? 'Configured; independent security and live testing remain required.' : 'Disabled or setup prerequisites not met.' } };
+  });
+
+  // Explicit MFA-gated diagnostics; never return the Redis URL or token.
+  app.post('/admin/upstash/check', async req => {
+    await assertAdmin(req.ctx);
+    return {...await checkUpstash(), driver:String(process.env.RATE_LIMIT_BACKEND||'mongo').trim().toLowerCase(), queueBackend:'mongo'};
   });
 
   // Only a verified platform owner who has completed MFA in this session can

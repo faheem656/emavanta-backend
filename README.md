@@ -1,10 +1,10 @@
 # Emavanta backend — Node.js
 
-This directory is a standalone Node.js 22+ Fastify application. It has its own `package.json`, lockfile, `.env.example`, API, workers, database/queue modules and diagnostics. It does not need the frontend source directory. The frontend is a separately hosted Next.js application.
+This directory is a standalone Node.js 22+ Fastify application. The backend root `server.js` is the actual startup file (`npm start` or `node server.js`). It has its own `package.json`, lockfile, `.env.example`, API, workers, database/queue modules and diagnostics. It does not need the frontend source directory. The frontend is a separately hosted Next.js application.
 
 ## Windows / local setup
 
-Extract **this backend folder** into its own location. Preserve your existing secrets and data when upgrading. If upgrading from the earlier combined project, copy the previous `.env` to this folder; otherwise copy `.env.example` to `.env`. Never upload or share `.env`.
+Extract **this backend folder** into its own location. For a local run, change the example APP_URL to http://localhost:3000; for deployment, use the real frontend HTTPS origin. Preserve your existing secrets and data when upgrading. If upgrading from the earlier combined project, copy the previous `.env` to this folder; otherwise copy `.env.example` to `.env`. Never upload or share `.env`.
 
 ```powershell
 npm ci
@@ -52,3 +52,7 @@ Set `PLATFORM_OWNER_EMAIL` and SMTP settings. Contact requests are saved in Mong
 ## Current limitations
 
 Read `docs/OPERATIONS-REVIEW.md` before deployment: not all plan limits or calendar-based sending counters are fully enforced, campaign reservation and queueing are not one atomic operation, and email delivery is at-least-once. The build is not certified production-ready.
+
+### Separate-domain checklist
+
+Set `APP_URL` to the public **frontend** HTTPS origin and deploy this backend to its own HTTPS domain. The frontend host sets its own `API_ORIGIN` to the backend HTTPS origin before building. Additional exact browser origins can be configured with `CORS_ALLOWED_ORIGINS`; public embedded forms permit cross-origin requests without credentials. CORS is not access control. See `SEPARATE-DOMAIN-DEPLOYMENT.md` included in the download for the complete checklist.
