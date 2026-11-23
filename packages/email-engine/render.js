@@ -25,7 +25,10 @@ export const renderMessage = ({ template, recipient, account, campaign, organiza
   const recipientId = recipient._id || recipient.id || recipient.email;
   const messageId = stableHash('message', campaignId, recipient.email);
   const common = { org, campaignId, contactId: recipientId, messageId, email: recipient.email,
-    sendingAccountId: account._id };
+    sendingAccountId: account._id,
+    ...(campaign.automationId ? { automationId: campaign.automationId } : {}),
+    ...(campaign.automationEnrollmentId ? { automationEnrollmentId: campaign.automationEnrollmentId } : {}),
+    ...(Number.isInteger(campaign.sequenceStepIndex) ? { sequenceStepIndex: campaign.sequenceStepIndex } : {}) };
   const unsubscribeToken = signLink({ ...common, kind: 'u' });
   const openToken = signLink({ ...common, kind: 'o' });
   const unsubscribeUrl = trackUrl(`/u/${unsubscribeToken}`);

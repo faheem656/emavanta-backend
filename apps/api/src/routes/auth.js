@@ -7,6 +7,9 @@ import { unauthorized, conflict, badRequest, notFound, tooMany, AppError } from 
 import { randomBytes, randomInt, createHash } from 'node:crypto';
 import { sendVerificationCode, sendWelcomeMail, sendResetMail, sendPasswordChangedMail, smtpConfigured } from '../mail-auth.js';
 import { audit } from '../plugins/audit.js';
+import { config } from '../config.js';
+import { sessionNotExpired, sessionExpiresAt } from '../../../../packages/security/session-policy.js';
+import { ensureWorkspaceDefaultContent } from '../../../../packages/onboarding/defaultContent.js';
 
 const demo = () => process.env.DEMO_MODE === 'true' && process.env.NODE_ENV === 'test';
 const publicUser = u => ({ id: u._id || u.id, email: u.email, name: u.name,
@@ -31,16 +34,19 @@ const DEVICE = ua => {
 /** Every sign-in creates a real, revocable session so Security shows true device state. */
 const startSession = async ({ req, user, role, orgId, membershipId, scopes = [], mfaVerified = false }) => {
   const sid = newId();
-  const now = new Date().toISOString();
+  const now = new Date();
+  const createdAt = now.toISOString();
+  const expiresAt = new Date(now.getTime() + config.sessionTtlDays * 86_400_000).toISOString();
   await collection('sessions').create({ _id: sid, sid, userId: user._id || user.id, organizationId: orgId,
     membershipId: membershipId || null, role, mfaVerified, familyId: sid, status: 'active', device: DEVICE(req.headers['user-agent']),
-    userAgent: req.headers['user-agent'] || 'unknown', ip: req.ip || 'local', createdAt: now, lastSeenAt: now,
-    persistent: true, expiresAt: null, tokenHash: null });
-  return sid;
+    userAgent: req.headers['user-agent'] || 'unknown', ip: req.ip || 'local', createdAt, lastSeenAt: createdAt,
+    persistent: true, expiresAt, tokenHash: null });
+  return { sid, expiresAt };
 };
 
-const sessionFor = (user, role, orgId, membershipId, scopes = [], sid = null) => signSession({
-  sub: user._id || user.id, email: user.email, role, org: orgId, membershipId, workspaceScopes: scopes, sid
+const sessionFor = (user, role, orgId, membershipId, scopes = [], session = {}) => signSession({
+  sub: user._id || user.id, email: user.email, role, org: orgId, membershipId, workspaceScopes: scopes,
+  sid: session.sid, exp: Math.floor(Date.parse(session.expiresAt) / 1000)
 });
 
 /** Creates (or refreshes) the email-verification token for a user. */
@@ -96,8 +102,9 @@ export default async function authRoutes(app) {
   app.post('/auth/demo-login', async req => {
     if (!demo()) throw unauthorized('Demo login is only available in development mode');
     const user = { _id: 'demo-user', email: 'demo@emavanta.local', name: 'Demo Owner', emailVerified: true };
-    const sid = await startSession({ req, user, role: 'owner', orgId: 'demo-org', membershipId: 'demo-membership' });
-    const token = sessionFor(user, 'owner', 'demo-org', 'demo-membership', [], sid);
+    await ensureWorkspaceDefaultContent({ organizationId: 'demo-org' });
+    const session = await startSession({ req, user, role: 'owner', orgId: 'demo-org', membershipId: 'demo-membership' });
+    const token = sessionFor(user, 'owner', 'demo-org', 'demo-membership', [], session);
     await audit({ user: { id: user._id }, organizationId: 'demo-org' }, 'auth.demo_login', 'user', { ip: req.ip });
     return { token, user: publicUser(user), organizationId: 'demo-org', role: 'owner', demo: true };
   });
@@ -124,9 +131,10 @@ export default async function authRoutes(app) {
         message: 'Enter the 6-digit code from your authenticator app.' };
     }
 
-    const sid = await startSession({ req, user, role: membership.role, orgId: membership.organizationId,
+    await ensureWorkspaceDefaultContent({ organizationId: membership.organizationId });
+    const session = await startSession({ req, user, role: membership.role, orgId: membership.organizationId,
       membershipId: membership._id, scopes: membership.workspaceScopes || [] });
-    const token = sessionFor(user, membership.role, membership.organizationId, membership._id, membership.workspaceScopes || [], sid);
+    const token = sessionFor(user, membership.role, membership.organizationId, membership._id, membership.workspaceScopes || [], session);
     return { token, user: publicUser(user), organizationId: membership.organizationId, role: membership.role };
   });
 
@@ -148,6 +156,7 @@ export default async function authRoutes(app) {
     const membership = user && await collection('memberships').findOne({ userId: user._id, status: 'active' });
     if (!user || !membership || ['suspended','deleted'].includes(user.platformStatus)) throw unauthorized('Sign in again.');
     await collection('users').updateOne({ _id: user._id }, { $set: { emailVerified: true, emailVerifiedAt: new Date().toISOString() } });
+    await ensureWorkspaceDefaultContent({ organizationId: membership.organizationId });
     // Welcome is best-effort: verification remains successful if this separate message fails.
     void sendWelcomeMail(user.email);
     if (user.mfaEnabled) {
@@ -156,9 +165,9 @@ export default async function authRoutes(app) {
         status: 'pending', createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 5 * 60000).toISOString() });
       return { mfaRequired: true, challengeToken: challenge.raw, method: 'totp' };
     }
-    const sid = await startSession({ req, user, role: membership.role, orgId: membership.organizationId, membershipId: membership._id,
+    const session = await startSession({ req, user, role: membership.role, orgId: membership.organizationId, membershipId: membership._id,
       scopes: membership.workspaceScopes || [] });
-    const sessionToken = sessionFor(user, membership.role, membership.organizationId, membership._id, membership.workspaceScopes || [], sid);
+    const sessionToken = sessionFor(user, membership.role, membership.organizationId, membership._id, membership.workspaceScopes || [], session);
     return { token: sessionToken, user: publicUser({ ...user, emailVerified: true }), organizationId: membership.organizationId, role: membership.role };
   });
 
@@ -211,9 +220,10 @@ export default async function authRoutes(app) {
       { $set: { status: 'used', usedAt: new Date().toISOString() } });
     const membership = await collection('memberships').findOne({ userId: user._id, status: 'active' });
     if (!membership) throw unauthorized('No active membership');
-    const sid = await startSession({ req, user, role: membership.role, orgId: membership.organizationId,
+    await ensureWorkspaceDefaultContent({ organizationId: membership.organizationId });
+    const session = await startSession({ req, user, role: membership.role, orgId: membership.organizationId,
       membershipId: membership._id, scopes: membership.workspaceScopes || [], mfaVerified: true });
-    const token = sessionFor(user, membership.role, membership.organizationId, membership._id, membership.workspaceScopes || [], sid);
+    const token = sessionFor(user, membership.role, membership.organizationId, membership._id, membership.workspaceScopes || [], session);
     await audit({ user: { id: user._id }, organizationId: membership.organizationId },
       usedRecovery ? 'auth.login.recovery_code' : 'auth.login.mfa', 'user');
     return { token, user: publicUser(user), organizationId: membership.organizationId, role: membership.role,
@@ -262,12 +272,19 @@ export default async function authRoutes(app) {
   app.get('/auth/sessions', async req => {
     const rows = await collection('sessions').find({ userId: req.ctx.user.id, status: 'active' },
       { sort: { createdAt: -1 }, limit: 100 });
-    return rows.map(({ tokenHash, ...rest }) => ({
-      ...rest,
-      sid: rest._id,
-      current: rest._id === req.ctx.sessionId,
-      label: rest.userAgent || rest.device || 'Browser'
-    }));
+    const now = Date.now(), active = [];
+    for (const row of rows) {
+      if (!sessionNotExpired(row, now, config.sessionTtlDays)) {
+        await collection('sessions').updateOne({ _id: row._id, status: 'active' },
+          { $set: { status: 'expired', expiredAt: new Date(now).toISOString(), revokedReason: 'ttl_expired' } });
+        continue;
+      }
+      const { tokenHash, ...rest } = row;
+      active.push({ ...rest, expiresAt: sessionExpiresAt(row, config.sessionTtlDays),
+        sid: rest._id, current: rest._id === req.ctx.sessionId,
+        label: rest.userAgent || rest.device || 'Browser' });
+    }
+    return active;
   });
 
   /** Sends (dev: shows) a fresh verification link. Never reveals whether the address exists. */

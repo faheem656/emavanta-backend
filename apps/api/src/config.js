@@ -1,5 +1,6 @@
 import './env.js';
 import { describeMongoUri } from '../../../packages/shared/env.js';
+import { readSessionTtlDays } from '../../../packages/security/session-policy.js';
 
 const mongo = describeMongoUri(process.env.MONGODB_URI);
 
@@ -12,5 +13,6 @@ export const config = Object.freeze({
   mongo: { configured: mongo.configured, host: mongo.host || null, srv: !!mongo.srv,
     database: process.env.MONGODB_DB || mongo.database || 'emavanta' },
   appUrl: process.env.APP_URL || 'http://localhost:3000',
-  oauthBase: process.env.OAUTH_REDIRECT_BASE || 'http://localhost:4000'
+  oauthBase: process.env.OAUTH_REDIRECT_BASE || 'http://localhost:4000',
+  sessionTtlDays: readSessionTtlDays()
 });

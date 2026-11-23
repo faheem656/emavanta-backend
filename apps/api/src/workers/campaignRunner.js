@@ -102,14 +102,14 @@ const runBatch = async payload => {
   const org = await collection('organizations').findOne({ _id: organizationId });
   const tp = throughputFor(org?.plan || 'growth');
 
-  for (let i = checkpoint; i < recipientIds.length; i++) {
+    for (let i = checkpoint; i < recipientIds.length; i++) {
     const recipientId = recipientIds[i];
     const recipient = await scoped('campaign_recipients', ctx).findOne({ _id: recipientId });
     if (!recipient || recipient.status !== 'queued') {
       await scoped('campaign_batches', ctx).updateOne({ _id: batchId }, { $set: { checkpoint: i + 1 } });
       continue;
     }
-    const { account, state: next } = selectAccount({ accounts, strategy: rotation, contactId: recipientId, state });
+    const { account, state: next } = selectAccount({ accounts, strategy: rotation, contactId: recipientId, state, stream });
     state = next;
     if (!account) {
       // Daily caps / warmup exhausted. Park the batch at this checkpoint and come back —
@@ -152,30 +152,28 @@ export const startCampaignRunner = () => registerWorker('campaign', async (paylo
   // point of choosing it. Blast campaigns keep the fast batch path.
   const paced = stream === 'outreach' || campaign.sendMode === 'human';
   if (paced) {
-    // Paced campaigns work one checklist at a time. Recipients come from the batch
-    // document, so a launch of a million contacts never puts a million ids in a job.
+    // One pacer walks each batch and chooses a sender for every recipient. Keeping the
+    // whole selected pool in the job is what makes round-robin rotation independent of
+    // how many mailboxes the customer connected.
     const batchIds = payload.batchIds || [];
     const lists = [];
     if (batchIds.length) {
       for (const batchId of batchIds) {
         const batch = await scoped('campaign_batches', ctx).findOne({ _id: batchId });
         if (!batch || batch.status === 'done') continue;
-        lists.push({ batchId, recipientIds: batch.recipientIds || [] });
+        lists.push({ batchId, recipientIds: batch.recipientIds || [], cursor: Number(batch.index) || 0 });
       }
     } else if (recipientIds.length) {
-      lists.push({ batchId: null, recipientIds });
+      lists.push({ batchId: null, recipientIds, cursor: Number(payload.offset) || 0 });
     }
-    for (const { batchId, recipientIds: ids } of lists) {
+    const selectedPool = campaign.accountPool?.length ? campaign.accountPool : accountPool;
+    for (const { batchId, recipientIds: ids, cursor } of lists) {
       if (!ids.length) continue;
-      const perAccount = Math.ceil(ids.length / Math.max(accounts.length, 1));
-      let i = 0;
-      for (const account of accounts) {
-        const slice = ids.slice(i, i + perAccount); i += perAccount;
-        if (!slice.length) continue;
-        await getQueue('outreach').add('outreach.pacer', { organizationId, campaignId, accountId: account._id,
-          batchId, recipientIds: slice, sendPolicy: pacingFor(campaign), sendMode: campaign.sendMode || 'human', rotation },
-          { jobId: `pacer-${campaignId}-${account._id}-${batchId || 'adhoc'}` });
-      }
+      await getQueue('outreach').add('outreach.pacer', {
+        organizationId, campaignId, batchId, recipientIds: ids, accountPool: selectedPool,
+        rotation: campaign.rotation || rotation || 'round_robin', stream: campaign.stream || stream,
+        sendPolicy: pacingFor(campaign), selectionState: { cursor }
+      }, { jobId: `pacer-${campaignId}-${batchId || 'adhoc'}` });
     }
     return;
   }
@@ -183,7 +181,7 @@ export const startCampaignRunner = () => registerWorker('campaign', async (paylo
   // Fallback for events created before batching existed.
   let state = campaign.accountState || {};
   for (const recipientId of recipientIds) {
-    const { account, state: next } = selectAccount({ accounts, strategy: rotation, contactId: recipientId, state });
+    const { account, state: next } = selectAccount({ accounts, strategy: rotation, contactId: recipientId, state, stream });
     state = next;
     if (!account) continue;
     await deliverOne({ organizationId, campaignId, recipientId, account, template, campaign });

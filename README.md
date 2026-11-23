@@ -26,6 +26,10 @@ Replace the example values with the connection details from Atlas. Do **not** pa
 
 MongoDB Atlas or a replica set is required for transaction-dependent features including crypto. Production requires persistent MongoDB and refuses a missing or failed database; memory storage is local-only and nondurable. Back up and test database restoration.
 
+## Session expiry
+
+Set `SESSION_TTL_DAYS` in `backend/.env` to control how long each new sign-in remains valid. It must be a whole number from `1` to `365`; the default is `30`. For example, use `SESSION_TTL_DAYS=2` for two days or `SESSION_TTL_DAYS=30` for thirty days. Restart the backend after changing it. This is an absolute lifetime, not an inactivity timeout; expiry is stored with the session and signed into the JWT, and refresh-token rotation does not extend it. Manual logout and security revocation end a session earlier. Keep `JWT_SECRET` stable across restarts and use persistent MongoDB, or sessions can become invalid before their configured expiry. Previously issued sessions retain their stored expiry; legacy persistent sessions with no recorded expiry use their creation time and the configured lifetime.
+
 ## Email, owner and crypto
 
 Configure SMTP and `PLATFORM_OWNER_EMAIL` in `.env`; see `docs/HOSTINGER-EMAIL-SETUP.md`. Verify that owner's email, enable MFA and sign in again with MFA to access global administration. Run the commands **separately**:
@@ -40,6 +44,10 @@ npm test
 The SMTP test sends an optional message; acceptance does not guarantee inbox delivery. Signup OTP codes are stored as hashes, not plaintext. Do not expose passwords, tokens or codes.
 
 Stripe card and USDT payment flows are experimental and **disabled by default**; OAuth sender login remains disabled. Independent security, legal and live-service testing is required before accepting funds. For required configuration, signed webhook setup and limitations see `docs/PAYMENT-AND-EMAIL-SETUP.md`.
+
+## Workflow automations
+
+The workflow engine supports new contact/list, form, tag, manual and API triggers; email, wait and supported tracked-behavior condition steps; once-per-contact enrollment; and a review queue for ambiguous provider outcomes. Previously active legacy workflows are paused on startup for owner review and require explicit activation before they can send. Existing contacts are not backfilled. See [`AUTOMATION-ENGINE.md`](AUTOMATION-ENGINE.md) for trigger semantics, migration behavior and release verification.
 
 ## Workers and deployment
 

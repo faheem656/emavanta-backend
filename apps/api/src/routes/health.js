@@ -4,7 +4,7 @@ import { dbInfo, pingDB } from '../../../../packages/database/store.js';
 
 // Bumped whenever the dashboard starts depending on new API routes, so the web app
 // can tell the difference between "backend down" and "backend too old".
-export const API_SCHEMA = 11;
+export const API_SCHEMA = 12;
 
 const pkg = (() => {
   try { return JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')); }

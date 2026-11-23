@@ -7,7 +7,9 @@ import { getQueue } from '../../../../packages/queue/index.js';
 import { createContacts } from '../../../../packages/entitlements/contacts.js';
 import { expireCryptoSubscription } from '../payments/crypto-service.js';
 import { whiteLabelFor } from '../../../../packages/entitlements/branding.js';
+import { recordAutomationTriggers, recordAutomationTriggerForSequence, publishAutomationTriggerEvents } from '../../../../packages/automations/triggers.js';
 import { audit } from '../plugins/audit.js';
+import { ensureWorkspaceDefaultContent } from '../../../../packages/onboarding/defaultContent.js';
 
 /**
  * Hosted forms — the "put a form on my site and the leads land here" feature.
@@ -81,6 +83,11 @@ export default async function formRoutes(app) {
   /* ---------------------------------------------------------------- */
   /* Dashboard                                                        */
   /* ---------------------------------------------------------------- */
+
+  // Versioned, idempotent onboarding also runs here so existing signed-in workspaces
+  // receive new starter form releases without having to wait for another login.
+  app.post('/forms/ensure-defaults', async req =>
+    ensureWorkspaceDefaultContent({ organizationId: req.ctx.organizationId }));
 
   app.get('/forms', async req => {
     const rows = await scoped('forms', req.ctx).find({ deleted: { $ne: true } }, { sort: { createdAt: -1 } });
@@ -246,7 +253,7 @@ export default async function formRoutes(app) {
     const requestedList = form.listId && await collection('contact_lists').findOne({ _id: form.listId, organizationId: form.organizationId }) ? [form.listId] : [];
     const profile = { firstName: data.first_name || data.firstName || existing?.firstName || '',
       lastName: data.last_name || data.lastName || existing?.lastName || '', company: data.company || existing?.company || '', phone: data.phone || existing?.phone || '' };
-    await createContacts({ organizationId: form.organizationId, demo: process.env.DEMO_MODE === 'true' }, [{ email, ...profile, listIds: requestedList, source:`form:${form.slug}`, tags:form.tags || [] }]);
+    const contactCreation=await createContacts({ organizationId: form.organizationId, demo: process.env.DEMO_MODE === 'true' }, [{ email, ...profile, listIds: requestedList, source:`form:${form.slug}`, tags:form.tags || [] }],{deferAutomation:true});
     const contact = await contacts.findOne({ organizationId: form.organizationId, email, deleted: { $ne: true } });
     const contactId = contact._id, listIds = new Set(contact.listIds || []);
     await contacts.updateOne({ _id: contactId }, { $set: { ...profile, lastFormAt:now, lastFormId:form._id, source:`form:${form.slug}` } });
@@ -258,21 +265,8 @@ export default async function formRoutes(app) {
     };
     await collection('form_submissions').create(submission);
 
-    // Automations: a form submission is a real trigger, not a label.
-    let enrolled = 0;
-    const automationId = form.automationId;
-    if (automationId) {
-      const seq = await collection('sequences').findOne({ _id: automationId, organizationId: form.organizationId });
-      if (seq && seq.status === 'active') {
-        await collection('scheduled_jobs').create({ _id: newId(), organizationId: form.organizationId,
-          sequenceId: seq._id, contactId, step: 0, runAt: now, status: 'pending',
-          source: `form:${form.slug}` });
-        enrolled = 1;
-      }
-    }
-
-    // One outbox event per submission: analytics, webhooks and the automation runner all
-    // read it, and it survives a crash between the write and the publish.
+    // One outbox event per submission for analytics/webhooks. Trigger rows for
+    // automations are published only after this durable submission record exists.
     const { event } = await writeWithOutbox({
       organizationId: form.organizationId,
       docs: [{ name: 'delivery_events', doc: { _id: newId(), type: 'form_submitted', formId: form._id,
@@ -281,9 +275,22 @@ export default async function formRoutes(app) {
         payload: { formId: form._id, formSlug: form.slug, contactId, email, organizationId: form.organizationId } }
     });
     await getQueue('outbox').add('outbox.publish', { eventId: event._id }, { jobId: `outbox-${event._id}` });
+    if(contactCreation.automationTriggerEventIds?.length){
+      try{await publishAutomationTriggerEvents(contactCreation.automationTriggerEventIds);}
+      catch(error){console.warn('[automation] form list/tag trigger saved; queue publish deferred to scheduler sweep.',String(error?.code||'QUEUE_UNAVAILABLE'));}
+    }
+    const matched=await recordAutomationTriggers({organizationId:form.organizationId,trigger:'form_submitted',contactId,
+      formId:form._id,source:'form_submitted',sourceId:submission._id});
+    let enrolled=matched.queued;
+    if(form.automationId){
+      const linked=await recordAutomationTriggerForSequence({organizationId:form.organizationId,sequenceId:form.automationId,
+        contactId,source:'form_link',details:{formId:form._id,sourceId:submission._id}});
+      if(linked.queued&&!matched.eventIds?.includes(linked.eventId))enrolled++;
+    }
 
     return { ok: true, message: form.successMessage || 'Thanks — you are on the list.',
-      redirectUrl: form.redirectUrl || null, submissionId: submission._id, duplicate: !!existing, enrolled };
+      redirectUrl: form.redirectUrl || null, submissionId: submission._id, duplicate: !!existing, enrolled,
+      automationQueued:enrolled>0 };
   });
 
   /* Options for the form builder: which lists and automations can a form feed. */

@@ -10,6 +10,7 @@ import { connectDB, disconnectDB } from './packages/database/store.js';
 import { startWorkers } from './apps/api/src/workers/index.js';
 import { startSchedulerSweep } from './apps/api/src/workers/schedulerSweep.js';
 import { closeQueues, getQueue } from './packages/queue/index.js';
+import { prepareAutomationEngine } from './packages/automations/migrations.js';
 
 // Trust only explicitly configured reverse-proxy addresses/CIDRs; never trust arbitrary X-Forwarded-For.
 const trustedProxy=String(process.env.TRUSTED_PROXY_IPS||'').split(',').map(x=>x.trim()).filter(Boolean);
@@ -52,6 +53,8 @@ const dbState = await connectDB().catch(err => {
   process.exit(1);
 });
 console.log(`[api] storage: ${dbState.mode}${dbState.database ? ` · ${dbState.database}` : ''}`);
+const automationUpgrade=await prepareAutomationEngine();
+if(automationUpgrade.pausedLegacyFlows||automationUpgrade.cancelledLegacyJobs)console.log(`[automation] safely paused ${automationUpgrade.pausedLegacyFlows} legacy workflow(s) and cancelled ${automationUpgrade.cancelledLegacyJobs} untracked legacy job(s); review then reactivate explicitly.`);
 if (config.demo) { const { seedDemoData } = await import('./apps/api/src/seed.js'); await seedDemoData(); }
 const embeddedWorkers=process.env.RUN_EMBEDDED_WORKERS!=='false';
 if(embeddedWorkers)startWorkers();

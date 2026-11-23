@@ -15,8 +15,8 @@ export const eligibleAccounts = (accounts, { stream, now = new Date() } = {}) =>
 });
 
 /** Pure selection: returns { account, state } so callers can persist state per campaign. */
-export const selectAccount = ({ accounts, strategy = ROTATION.STICKY_BY_CONTACT, contactId, state = {}, now }) => {
-  const pool = eligibleAccounts(accounts, { now });
+export const selectAccount = ({ accounts, strategy = ROTATION.ROUND_ROBIN, contactId, state = {}, stream, now }) => {
+  const pool = eligibleAccounts(accounts, { stream, now });
   if (!pool.length) return { account: null, state, reason: 'NO_ELIGIBLE_ACCOUNT' };
   let account;
   if (strategy === ROTATION.STICKY_BY_CONTACT) {

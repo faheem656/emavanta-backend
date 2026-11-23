@@ -3,10 +3,13 @@ import { isMemoryMode } from '../../../../packages/database/store.js';
 import { collection } from '../../../../packages/database/store.js';
 import { getQueue } from '../../../../packages/queue/index.js';
 import { sweepStripe } from '../payments/stripe-service.js';
+import { publishAutomationTriggerEvents } from '../../../../packages/automations/triggers.js';
+import { enqueueAutomationStep } from '../../../../packages/automations/jobs.js';
 
 // A periodic sweep supplies the long-horizon poller after restarts. Claims expire
 // so a crash between claiming and queueing does not strand scheduled rows forever.
 export async function sweepScheduledJobs() {
+  const now=new Date().toISOString();
   if(!isMemoryMode()){
     const due=await collection('crypto_addon_grants').find({status:'active',expiresAt:{$lte:new Date().toISOString()}},{limit:200});
     for(const id of new Set(due.map(x=>x.organizationId).filter(Boolean)))await expireCryptoAddons(id);
@@ -15,7 +18,18 @@ export async function sweepScheduledJobs() {
   }
   const pendingEvents=await collection('outbox_events').find({status:'pending'},{limit:500});
   for(const event of pendingEvents) await getQueue('outbox').add('outbox.publish',{eventId:event._id},{jobId:`outbox-${event._id}`,retryFailed:true});
-  const jobs=collection('scheduled_jobs'), now=new Date().toISOString();
+  // Recover trigger events whose worker died after claiming them. finishTrigger
+  // is idempotent and uses the stable enrollment ID, so retry is safe.
+  await collection('automation_trigger_events').updateMany({status:'processing',leaseUntil:{$lte:now}},{$set:{status:'pending',leaseUntil:null,updatedAt:now}});
+  const automationEvents=await collection('automation_trigger_events').find({status:'pending'},{limit:500});
+  if(automationEvents.length)await publishAutomationTriggerEvents(automationEvents.map(event=>event._id));
+  const runningEnrollments=await collection('sequence_enrollments').find({status:{$in:['queued','waiting','running']}},{limit:500});
+  for(const enrollment of runningEnrollments){
+    const flow=await collection('sequences').findOne({_id:enrollment.sequenceId,organizationId:enrollment.organizationId,status:'active',executionEnabled:true,deleted:{$ne:true}});
+    if(flow)await enqueueAutomationStep({organizationId:enrollment.organizationId,sequenceId:enrollment.sequenceId,
+      enrollmentId:enrollment._id,stepIndex:enrollment.currentStep||0,runAt:enrollment.nextRunAt||now});
+  }
+  const jobs=collection('scheduled_jobs');
   await jobs.updateMany({status:'claimed',leaseUntil:{$lte:now}},{$set:{status:'pending'}});
   const due=await jobs.find({status:'pending',runAt:{$lte:now}},{limit:500});
   for(const organizationId of new Set(due.map(row=>row.organizationId).filter(Boolean))) {

@@ -1,6 +1,6 @@
 import { effectiveAddons } from '../../../../packages/entitlements/definitions.js';
 import { scoped, collection, nativeDatabase, isMemoryMode } from '../../../../packages/database/store.js';
-import { assertPermission, PERMISSIONS } from '../../../../packages/security/rbac.js';
+import { assertPermission, PERMISSIONS, canAccessWorkspace } from '../../../../packages/security/rbac.js';
 import { campaignSchema, campaignDraftSchema } from '../../../../packages/validation/index.js';
 import { pacingFor, estimate } from '../../../../packages/email-engine/cadence.js';
 import { blocksToHtml } from '../../../../packages/email-engine/template.js';
@@ -17,6 +17,25 @@ import { audit } from '../plugins/audit.js';
 import { whiteLabelFor } from '../../../../packages/entitlements/branding.js';
 import { renderMessage } from '../../../../packages/email-engine/render.js';
 import { sendMessage } from '../../../../packages/providers/index.js';
+
+/** A campaign may send only from its explicitly selected, organization-scoped, verified mailbox pool. */
+const selectedSenderPool = async (ctx, campaign) => {
+  const ids = Array.isArray(campaign.accountPool) ? campaign.accountPool : [];
+  if (!ids.length) throw badRequest('Select at least one verified sending mailbox before launch.');
+  const uniqueIds = [...new Set(ids)];
+  if (uniqueIds.length !== ids.length) throw badRequest('Remove duplicate mailboxes from the sender pool.');
+  const accounts = await scoped('sending_accounts', ctx).find({ _id: { $in: uniqueIds } });
+  if (accounts.length !== uniqueIds.length) throw badRequest('One or more selected mailboxes is unavailable in this workspace.');
+  const now = Date.now();
+  const invalid = accounts.some(account => account.status !== 'active'
+    || (account.authMethod === 'mock' && process.env.NODE_ENV !== 'test')
+    || (account.tokenExpiresAt && (!Number.isFinite(Date.parse(account.tokenExpiresAt)) || Date.parse(account.tokenExpiresAt) <= now))
+    || !canAccessWorkspace(ctx, account.workspaceId));
+  if (invalid) throw badRequest('Every selected mailbox must be active, verified, and accessible. Reconnect or remove any mailbox that needs attention.');
+  if (accounts.some(account => account.stream && account.stream !== campaign.stream))
+    throw badRequest(`Every selected mailbox must support the ${campaign.stream} stream. Update the pool or mailbox stream.`);
+  return accounts;
+};
 
 export default async function campaignRoutes(app) {
   app.get('/campaigns', async req => scoped('campaigns', req.ctx).find({}, { sort: { createdAt: -1 } }));
@@ -167,10 +186,10 @@ export default async function campaignRoutes(app) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(to) || to.length > 254) throw badRequest('Valid test recipient required');
     const template = await scoped('templates', req.ctx).findOne({ _id: c.templateId });
     if (!template) throw badRequest('Template missing');
-    const accounts = await scoped('sending_accounts', req.ctx).find({ status: 'active' });
-    const account = accounts.find(a => a._id === req.body.accountId)
-      || accounts.find(a => (c.accountPool || []).includes(a._id)) || accounts[0];
-    if (!account) throw badRequest('Connect a sending account first');
+    const accounts = await selectedSenderPool(req.ctx, c);
+    if (req.body.accountId && !accounts.some(a => a._id === req.body.accountId))
+      throw badRequest('Choose a mailbox from this campaign’s selected sender pool.');
+    const account = req.body.accountId ? accounts.find(a => a._id === req.body.accountId) : accounts[0];
     const recipient = { _id: `test-${stableHash('recipient', c._id, to)}`, email: to,
       firstName: 'Test', lastName: '', company: 'Test preview', customFields: {} };
     const org=await collection('organizations').findOne({_id:req.ctx.organizationId});
@@ -202,6 +221,7 @@ export default async function campaignRoutes(app) {
     if (!c) throw notFound('Campaign not found');
     if (!['draft','paused'].includes(c.status)) throw badRequest(`Campaign is ${c.status}`);
     if (c.startAt && Date.parse(c.startAt) > Date.now()) throw badRequest('Scheduled launch is not supported yet. Launch when you are ready.');
+    const senderPool = await selectedSenderPool(req.ctx, c);
     const template = await scoped('templates', req.ctx).findOne({ _id: c.templateId });
     if (!template) throw badRequest('Template missing');
     const html = template.mode === 'code' ? template.html : blocksToHtml(template.blocks, template.styles);
@@ -238,7 +258,7 @@ export default async function campaignRoutes(app) {
       gapSeconds: c.gapSeconds || pacing.minDelaySec, dailyCap: pacing.dailyCap,
       perBatch: streamConfig(c.stream).batchSize });
     if (req.body.confirm !== true) return { requiresConfirmation: true, recipients: total,
-      accounts: c.accountPool.length, stream: c.stream, quota: preview, sendMode: c.sendMode || 'human',
+      accounts: senderPool.length, stream: c.stream, quota: preview, sendMode: c.sendMode || 'human',
       pace, batchSize: streamConfig(c.stream).batchSize, intakeChunk: INTAKE_CHUNK, throughput,
       note: 'Recipients are copied in the background in chunks of ' + INTAKE_CHUNK.toLocaleString() + ', so the launch returns immediately.' };
 

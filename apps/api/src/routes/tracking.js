@@ -21,7 +21,8 @@ const record = async (d, type, extra = {}) => {
   if (await scoped('delivery_events', ctx).findOne({ dedupeKey })) return false;
   await collection('delivery_events').create({ _id: newId(), organizationId: d.org, type,
     dedupeKey, campaignId: d.campaignId, contactId: d.contactId, messageId: d.messageId, email: d.email,
-    sendingAccountId: d.sendingAccountId, provider: 'tracking-link', ...extra, createdAt: new Date().toISOString() });
+    sendingAccountId: d.sendingAccountId, automationId:d.automationId, automationEnrollmentId:d.automationEnrollmentId,
+    sequenceStepIndex:d.sequenceStepIndex, provider: 'tracking-link', ...extra, createdAt: new Date().toISOString() });
   if (d.campaignId && ['opened', 'clicked', 'unsubscribed', 'delivered'].includes(type)) {
     await collection('campaigns').updateOne({ _id: d.campaignId }, { $inc: { [`stats.${type}`]: 1 } });
   }

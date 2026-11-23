@@ -5,6 +5,7 @@ import { newId, stableHash } from '../../../../packages/shared/utils.js';
 import { badRequest, notFound } from '../../../../packages/shared/errors.js';
 import { getQueue } from '../../../../packages/queue/index.js';
 import { createContacts } from '../../../../packages/entitlements/contacts.js';
+import { recordAutomationTriggers } from '../../../../packages/automations/triggers.js';
 
 const listName = value => {
   const name = String(value || '').trim();
@@ -41,15 +42,19 @@ export default async function contactRoutes(app) {
 
   app.patch('/contacts/:id', async req => {
     assertPermission(req.ctx, PERMISSIONS.CONTACTS_WRITE);
-    if(req.body?.email!==undefined){
-      const contact=await scoped('contacts',req.ctx).findOne({_id:req.params.id});
-      if(!contact)throw notFound('Contact not found');
-      if(String(req.body.email).trim().toLowerCase()!==contact.email)throw badRequest('Contact email cannot be changed. Create a new contact instead.');
-    }
+    const previous=await scoped('contacts',req.ctx).findOne({_id:req.params.id,deleted:{$ne:true}});
+    if(!previous)throw notFound('Contact not found');
+    if(req.body?.email!==undefined&&String(req.body.email).trim().toLowerCase()!==previous.email)
+      throw badRequest('Contact email cannot be changed. Create a new contact instead.');
     const allowed=['firstName','lastName','company','customFields','phone','city','country','title','tags','listIds'];
     const changes=Object.fromEntries(Object.entries(req.body||{}).filter(([key])=>allowed.includes(key)));
-    if (changes.listIds !== undefined) changes.listIds=await validLists(req.ctx,changes.listIds);
-    await scoped('contacts', req.ctx).updateOne({ _id: req.params.id }, { $set: changes });
+    if(changes.listIds!==undefined)changes.listIds=await validLists(req.ctx,changes.listIds);
+    if(changes.tags!==undefined){if(!Array.isArray(changes.tags)||changes.tags.length>50||changes.tags.some(t=>typeof t!=='string'||t.trim().length>80))throw badRequest('Choose at most 50 valid tags.');changes.tags=[...new Set(changes.tags.map(t=>t.trim()).filter(Boolean))];}
+    await scoped('contacts',req.ctx).updateOne({_id:req.params.id},{$set:changes});
+    const addedLists=(changes.listIds||[]).filter(id=>!(previous.listIds||[]).includes(id));
+    const addedTags=(changes.tags||[]).filter(tag=>!(previous.tags||[]).some(old=>String(old).toLowerCase()===tag.toLowerCase()));
+    if(addedLists.length)await recordAutomationTriggers({organizationId:req.ctx.organizationId,trigger:'contact_added',contactId:previous._id,listIds:addedLists,source:'contact_list_added'});
+    if(addedTags.length)await recordAutomationTriggers({organizationId:req.ctx.organizationId,trigger:'tag_added',contactId:previous._id,tags:addedTags,source:'contact_tag_added'});
     return { ok: true };
   });
 
@@ -69,10 +74,13 @@ export default async function contactRoutes(app) {
     let count=0;
     if(action==='add_to_list') await validLists(req.ctx,[req.body.listId]);
     for (const id of ids) {
+      const before=action==='add_to_list'?await scoped('contacts',req.ctx).findOne({_id:id,deleted:{$ne:true}}):null;
       const result=await scoped('contacts',req.ctx).updateOne({ _id:id, deleted:{$ne:true} }, action==='delete'
         ? { $set:{deleted:true,deletedAt:new Date().toISOString(),listIds:[]} }
         : { $addToSet:{listIds:req.body.listId} });
       count+=result.matchedCount||0;
+      if(before&&!((before.listIds||[]).includes(req.body.listId)))await recordAutomationTriggers({organizationId:req.ctx.organizationId,
+        trigger:'contact_added',contactId:id,listIds:[req.body.listId],source:'contact_list_added'});
     }
     return {ok:true,matched:count};
   });
@@ -96,6 +104,7 @@ export default async function contactRoutes(app) {
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { skipped += 1; continue; }
       docs.push({ _id: stableHash(req.ctx.organizationId, email), organizationId: req.ctx.organizationId,
         email, firstName: row.firstName || '', lastName: row.lastName || '', company: row.company || '',
+        tags:Array.isArray(row.tags)?[...new Set(row.tags.filter(x=>typeof x==='string').map(x=>x.trim()).filter(x=>x&&x.length<=80))].slice(0,50):[],
         listIds: Array.isArray(row.listIds) ? row.listIds : [], dedupeKey: stableHash(req.ctx.organizationId, email),
         createdAt: now, updatedAt: now });
     }
@@ -105,11 +114,14 @@ export default async function contactRoutes(app) {
 
   app.post('/contacts/:id/lists', async req => {
     assertPermission(req.ctx, PERMISSIONS.CONTACTS_WRITE);
-    const contact = await scoped('contacts', req.ctx).findOne({ _id: req.params.id });
-    if (!contact) throw notFound('Contact not found');
-    const ids = await validLists(req.ctx, req.body.listIds || []);
-    await scoped('contacts', req.ctx).updateOne({ _id: req.params.id }, { $set: { listIds: ids } });
-    return { ok: true, listIds: ids };
+    const contact=await scoped('contacts',req.ctx).findOne({_id:req.params.id,deleted:{$ne:true}});
+    if(!contact)throw notFound('Contact not found');
+    const ids=await validLists(req.ctx,req.body.listIds||[]);
+    await scoped('contacts',req.ctx).updateOne({_id:req.params.id},{$set:{listIds:ids}});
+    const added=ids.filter(id=>!(contact.listIds||[]).includes(id));
+    if(added.length)await recordAutomationTriggers({organizationId:req.ctx.organizationId,trigger:'contact_added',contactId:contact._id,
+      listIds:added,source:'contact_list_added'});
+    return {ok:true,listIds:ids};
   });
 
   app.post('/contacts/import', async req => {

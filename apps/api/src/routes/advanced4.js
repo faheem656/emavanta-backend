@@ -16,6 +16,8 @@ import { audit } from '../plugins/audit.js';
 import { MAIL_STREAMS, dnsAdvice, verifyDns, classifyEvent, reputationScore, warmupPlan, seedPlacementScore } from '../../../../packages/deliverability/index.js';
 import { acquireStream, resetRateLimiter } from '../../../../packages/rate-limiter/index.js';
 import { newRefreshToken, rotateRefresh, tokenHash } from '../../../../packages/security/session.js';
+import { sessionNotExpired, sessionExpiresAt } from '../../../../packages/security/session-policy.js';
+import { config } from '../config.js';
 import { importPreview } from '../../../../packages/email-engine/import.js';
 import { renderText, extractTokens } from '../../../../packages/email-engine/personalization.js';
 import { preflight } from '../../../../packages/email-engine/preflight.js';
@@ -105,10 +107,20 @@ export default async function advanced4Routes(app) {
   app.get('/security/sessions', async req => {
     const rows = await collection('sessions').find({ organizationId: req.ctx.organizationId, status: 'active' },
       { sort: { createdAt: -1 }, limit: 100 });
-    return rows.map(({ tokenHash: h, ...rest }) => ({ ...rest,
-      current: !!req.ctx.sessionId && rest._id === req.ctx.sessionId,
-      isSelf: rest.userId === req.ctx.user.id,
-      device: rest.device || 'Unknown device' }));
+    const now = Date.now(), active = [];
+    for (const row of rows) {
+      if (!sessionNotExpired(row, now, config.sessionTtlDays)) {
+        await collection('sessions').updateOne({ _id: row._id, status: 'active' },
+          { $set: { status: 'expired', expiredAt: new Date(now).toISOString(), revokedReason: 'ttl_expired' } });
+        continue;
+      }
+      const { tokenHash: h, ...rest } = row;
+      active.push({ ...rest, expiresAt: sessionExpiresAt(row, config.sessionTtlDays),
+        current: !!req.ctx.sessionId && rest._id === req.ctx.sessionId,
+        isSelf: rest.userId === req.ctx.user.id,
+        device: rest.device || 'Unknown device' });
+    }
+    return active;
   });
   app.delete('/security/sessions', async req => {
     if (!req.ctx.sessionId || !['owner','admin','super_admin'].includes(req.ctx.user.role)) throw forbidden('Only owners and admins can sign out other sessions.');
@@ -149,9 +161,10 @@ export default async function advanced4Routes(app) {
   });
   app.post('/security/sessions', async req => {
     const familyId = newId();
-    const { token, record } = newRefreshToken({ userId: req.ctx.user.id, organizationId: req.ctx.organizationId, familyId });
-    await collection('sessions').create({ ...record, userAgent: req.headers['user-agent'] || 'unknown', ip: req.ip });
-    return { refreshToken: token, sessionId: record._id, note: 'Store in httpOnly+Secure+SameSite=Lax cookie; never in localStorage.' };
+    const { token, record } = newRefreshToken({ userId: req.ctx.user.id, organizationId: req.ctx.organizationId,
+      familyId, ttlDays: config.sessionTtlDays });
+    const created = await collection('sessions').create({ ...record, userAgent: req.headers['user-agent'] || 'unknown', ip: req.ip });
+    return { refreshToken: token, sessionId: created._id, note: 'Store in httpOnly+Secure+SameSite=Lax cookie; never in localStorage.' };
   });
   app.post('/security/sessions/refresh', async req => {
     const token = req.body.refreshToken || req.cookies?.refresh_token;
@@ -164,8 +177,8 @@ export default async function advanced4Routes(app) {
       throw badRequest('Refresh token reuse detected; family revoked');
     }
     await collection('sessions').updateOne({ _id: record._id }, { $set: { status: 'rotated', rotatedAt: new Date().toISOString() } });
-    await collection('sessions').create(rotated.session);
-    return { ok: true, refreshToken: rotated.token, sessionId: rotated.session._id };
+    const created = await collection('sessions').create(rotated.session);
+    return { ok: true, refreshToken: rotated.token, sessionId: created._id };
   });
   app.delete('/security/sessions/:id', async req => {
     if (!req.ctx.sessionId || !['owner','admin','super_admin'].includes(req.ctx.user.role)) throw forbidden('Only owners and admins can sign out sessions.');

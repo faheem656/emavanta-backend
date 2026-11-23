@@ -280,6 +280,15 @@ function memoryCollection(name) {
       if (i > -1) docs[i] = saved; else docs.push(saved);
       return { ...saved };
     },
+    async insertIfAbsent(doc) {
+      const id = doc._id || newId();
+      const existing = docs.find(d => String(d._id) === String(id));
+      if (existing) return { inserted: false, document: { ...existing } };
+      const now = new Date().toISOString();
+      const saved = { _id: id, createdAt: doc.createdAt || now, updatedAt: now, ...doc };
+      docs.push(saved);
+      return { inserted: true, document: { ...saved } };
+    },
     async insertMany(arr) { const out = []; for (const d of arr) out.push(await this.create(d)); return out; },
     /** Bulk upsert used by campaign intake: one call per chunk instead of one per row. */
     async bulkCreate(arr) { const out = []; for (const d of arr) out.push(await this.create(d)); return out; },
@@ -330,6 +339,9 @@ const INDEXES = {
   campaign_chunks: [[{ organizationId: 1, campaignId: 1, offset: 1 }]],
   delivery_events: [[{ organizationId: 1, campaignId: 1, type: 1 }], [{ dedupeKey: 1 }]],
   outbox_events: [[{ status: 1, createdAt: 1 }]],
+  automation_trigger_events: [[{ organizationId: 1, status: 1, createdAt: 1 }], [{ organizationId: 1, sequenceId: 1, status: 1 }]],
+  sequence_enrollments: [[{ organizationId: 1, sequenceId: 1, status: 1 }], [{ organizationId: 1, contactId: 1, sequenceId: 1 }]],
+  sequence_step_runs: [[{ organizationId: 1, enrollmentId: 1, stepIndex: 1 }]],
   sessions: [[{ organizationId: 1, status: 1 }], [{ 'token.jti': 1 }]],
   sending_accounts: [[{ organizationId: 1, status: 1 }]],
   usage_counters: [[{ organizationId: 1, cycle: 1 }]]
@@ -375,7 +387,21 @@ function mongoCollection(name) {
       await col().replaceOne({ _id: row._id }, row, { upsert: true });
       return row;
     },
+    async insertIfAbsent(doc) {
+      const now = new Date().toISOString();
+      const row = { ...doc, _id: doc._id || newId(), createdAt: doc.createdAt || now, updatedAt: now };
+      try {
+        await col().insertOne(row);
+        return { inserted: true, document: row };
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+        const existing = await col().findOne({ _id: row._id });
+        if (!existing) throw error;
+        return { inserted: false, document: existing };
+      }
+    },
     async insertMany(arr) { const out = []; for (const d of arr) out.push(await this.create(d)); return out; },
+
     /** Unordered bulk upsert: 2 000 documents in one round trip instead of 2 000. */
     async bulkCreate(arr) {
       if (!arr?.length) return [];

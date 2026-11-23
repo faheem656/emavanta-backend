@@ -23,9 +23,15 @@ export const contextPlugin = fp(async app => {
         // "sign out", "sign out everywhere" and an admin force-logout real.
         if (payload.sid) {
           const session = await collection('sessions').findOne({ _id: payload.sid });
-          // A signed-out session must answer 401 with a sentence the UI can show, not a
-          // generic 500. Without this the client sees "Internal error" on every old tab.
-          if (!session || session.status !== 'active' || session.userId !== payload.sub || session.organizationId !== payload.org || !sessionNotExpired(session)) {
+          const withinLifetime = sessionNotExpired(session);
+          if (session?.status === 'active' && !withinLifetime) {
+            await collection('sessions').updateOne({ _id: payload.sid, status: 'active' },
+              { $set: { status: 'expired', expiredAt: new Date().toISOString(), revokedReason: 'ttl_expired' } });
+          }
+          // A signed-out or expired session must answer 401 with a sentence the UI can show, not a
+          // generic 500. The client removes its bearer token after this explicit 401.
+          if (!session || session.status !== 'active' || session.userId !== payload.sub ||
+              session.organizationId !== payload.org || !withinLifetime) {
             throw unauthorized('This session has expired or was signed out. Sign in again.');
           }
         }

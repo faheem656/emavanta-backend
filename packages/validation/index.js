@@ -11,7 +11,7 @@ export const contactSchema = z.object({
   company: z.string().max(120).optional(), customFields: z.record(z.string()).default({}),
   phone: z.string().max(40).optional(), city: z.string().max(80).optional(),
   country: z.string().max(80).optional(), title: z.string().max(120).optional(),
-  tags: z.array(z.string()).optional(),
+  tags: z.array(z.string().trim().min(1).max(80)).max(50).optional(),
   listIds: z.array(z.string()).default([])
 });
 export const sendPolicySchema = z.object({
@@ -29,15 +29,15 @@ export const sendPolicySchema = z.object({
 export const sequenceSchema = z.object({ name: z.string().min(2).max(120),
   description: z.string().max(280).optional(),
   trigger: z.enum(['manual','contact_added','form_submitted','tag_added','api']).optional(),
-  listId: z.string().optional(),
+  listId: z.string().max(120).optional(), triggerTag: z.string().trim().min(1).max(80).optional(),
   accountId: z.string().max(120).optional(),
   status: z.enum(['draft','paused','active']).optional(),
   formId: z.string().max(80).optional(),
   steps: z.array(z.object({
-    type: z.enum(['email','delay','condition']), templateId: z.string().optional(), accountId: z.string().max(120).optional(),
-    delayMinutes: z.number().int().min(0).optional(), condition: z.string().optional(),
+    type: z.enum(['email','delay','condition']), templateId: z.string().max(120).optional(), accountId: z.string().max(120).optional(),
+    delayMinutes: z.number().int().min(0).max(525600).optional(), condition: z.string().trim().max(120).optional(),
     subject: z.string().max(200).optional()
-  })).min(1) });
+  })).min(1).max(30) });
 export const templateSchema = z.object({
   name: z.string().min(2).max(120), subject: z.string().min(1).max(200),
   blocks: z.array(z.object({ type: z.string(), content: z.string().default(''),
@@ -69,14 +69,16 @@ export const templateSchema = z.object({
   html: z.string().optional(), mode: z.enum(['blocks','code']).default('blocks')
 });
 export const campaignSchema = z.object({
-  name: z.string().min(2).max(120), stream: z.enum(['transactional','marketing','outreach']),
+  name: z.string().min(2).max(120), description: z.string().max(280).optional(),
+  stream: z.enum(['transactional','marketing','outreach']),
   // 'blast' = everyone as fast as the mailboxes allow, 'human' = one at a time with a
   // natural pause, which is what keeps cold outreach from looking like a machine.
   sendMode: z.enum(['blast','human']).default('human'),
   gapSeconds: z.number().int().min(5).max(3600).optional(),
-  listIds: z.array(z.string()).min(1), templateId: z.string(),
-  accountPool: z.array(z.string()).min(1),
-  rotation: z.enum(['round_robin','weighted','least_used','random_jitter','sticky_by_contact']).default('sticky_by_contact'),
+  // Drafts may be incomplete during setup. Launch performs strict audience and sender checks.
+  listIds: z.array(z.string()).default([]), templateId: z.string(),
+  accountPool: z.array(z.string()).default([]),
+  rotation: z.enum(['round_robin','weighted','least_used','random_jitter','sticky_by_contact']).default('round_robin'),
   sendPolicy: sendPolicySchema.optional(),
   sequenceSteps: z.array(z.object({
     type: z.enum(['email','delay','condition']),

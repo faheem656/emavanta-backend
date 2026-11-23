@@ -5,14 +5,16 @@ import { startIntakeWorker } from './intakeWorker.js';
 import { startWebhookProcessor } from './webhookProcessor.js';
 import { startContactMailWorker } from './contactMail.js';
 import { startOtherWorkers } from './otherWorkers.js';
+import { startAutomationRunner } from './automationRunner.js';
 
 export const startWorkers = () => {
   startOutboxRelay();
   startContactMailWorker();
   startCampaignRunner();
+  startAutomationRunner();
   startIntakeWorker();
   startOutreachPacer();
   startWebhookProcessor();
   startOtherWorkers();
-  console.log('[workers] registered: outbox, campaign, intake, outreach, webhook, webhook_out, import, analytics, scheduler, billing, report, reconcile');
+  console.log('[workers] registered: outbox, campaign, intake, outreach, automation, webhook, webhook_out, import, analytics, scheduler, billing, report, reconcile');
 };
