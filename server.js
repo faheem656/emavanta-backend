@@ -14,7 +14,13 @@ import { prepareAutomationEngine } from './packages/automations/migrations.js';
 
 // Trust only explicitly configured reverse-proxy addresses/CIDRs; never trust arbitrary X-Forwarded-For.
 const trustedProxy=String(process.env.TRUSTED_PROXY_IPS||'').split(',').map(x=>x.trim()).filter(Boolean);
-const app = Fastify({ ...(trustedProxy.length?{trustProxy:trustedProxy}:{}), routerOptions: { maxParamLength: 2048 }, logger: { level: process.env.LOG_LEVEL || 'warn' }, requestIdHeader: 'x-request-id' });
+const app = Fastify({
+  ...(trustedProxy.length ? { trustProxy: trustedProxy } : {}),
+  bodyLimit: 6 * 1024 * 1024,
+  routerOptions: { maxParamLength: 2048 },
+  logger: { level: process.env.LOG_LEVEL || 'warn' },
+  requestIdHeader: 'x-request-id'
+});
 await app.register(cors, { delegator: corsDelegator(allowedFrontendOrigins()) });
 
 // Browsers/proxies sometimes send `content-type: application/json` with an empty body
