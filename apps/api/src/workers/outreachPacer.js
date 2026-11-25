@@ -106,7 +106,17 @@ export const startOutreachPacer = () => registerWorker('outreach', async payload
     return;
   }
 
-  await deliverOne({ organizationId, campaignId, recipientId, account, template, campaign });
+  const delivery = await deliverOne({ organizationId, campaignId, recipientId, account, template, campaign, sendPolicy });
+
+  if (delivery?.deferred) {
+    const retryAt = nextSendAt(sendPolicy, new Date());
+    await defer(retryAt.getTime() - Date.now(), {
+      ...payload,
+      recipientIds: [recipientId, ...rest],
+      selectionState: state
+    });
+    return;
+  }
 
   if (rest.length) {
     const delay = nextSendAt(sendPolicy, new Date()).getTime() - Date.now();

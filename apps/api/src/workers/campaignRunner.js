@@ -8,12 +8,21 @@ import { streamConfig, throughputFor } from '../../../../packages/deliverability
 import { newId } from '../../../../packages/shared/utils.js';
 import { expireCryptoSubscription } from '../payments/crypto-service.js';
 import { whiteLabelFor } from '../../../../packages/entitlements/branding.js';
-import { pacingFor } from '../../../../packages/email-engine/cadence.js';
+import { pacingFor, isWithinWindow, nextSendAt } from '../../../../packages/email-engine/cadence.js';
 
 const domainOf = account => String(account.fromEmail || '').split('@')[1] || 'unknown';
 
-export const deliverOne = async ({ organizationId, campaignId, recipientId, account, template, campaign }) => {
+export const deliverOne = async ({ organizationId, campaignId, recipientId, account, template, campaign, sendPolicy }) => {
   const ctx = { organizationId };
+  const effectiveSendPolicy = sendPolicy || pacingFor(campaign || {});
+  const scheduleNow = new Date();
+  if (!isWithinWindow(effectiveSendPolicy, scheduleNow)) {
+    return {
+      deferred: true,
+      reason: 'outside_campaign_schedule',
+      nextSendAt: nextSendAt(effectiveSendPolicy, scheduleNow).toISOString()
+    };
+  }
   let org = await collection('organizations').findOne({ _id: organizationId });
   if (!isMemoryMode()) {
     org = await expireCryptoSubscription(organizationId);
@@ -87,6 +96,7 @@ const runBatch = async payload => {
   ]);
   if (!campaign || !template || !batch) return;
   if (batch.status === 'done') return;
+  const sendPolicy = pacingFor({ ...campaign, sendPolicy: payload.sendPolicy || campaign.sendPolicy });
   const accounts = (accountPool.length ? allAccounts.filter(a => accountPool.includes(a._id)) : allAccounts).filter(a => a.status === 'active');
   if (!accounts.length) {
     // No mailbox can send right now: keep the batch queued and retry, never drop it.
@@ -103,6 +113,16 @@ const runBatch = async payload => {
   const tp = throughputFor(org?.plan || 'growth');
 
     for (let i = checkpoint; i < recipientIds.length; i++) {
+    const scheduleNow = new Date();
+    if (!isWithinWindow(sendPolicy, scheduleNow)) {
+      const retryAt = nextSendAt(sendPolicy, scheduleNow);
+      await scoped('campaign_batches', ctx).updateOne({ _id: batchId },
+        { $set: { checkpoint: i, blockedAt: scheduleNow.toISOString(), blockedReason: 'campaign_schedule' } });
+      await getQueue('campaign').add('campaign.batch', { ...payload, batchId },
+        { jobId: `batch-${batchId}-schedule-${Math.floor(Date.now() / 60000)}`,
+          delay: Math.max(1000, retryAt.getTime() - Date.now()) });
+      return;
+    }
     const recipientId = recipientIds[i];
     const recipient = await scoped('campaign_recipients', ctx).findOne({ _id: recipientId });
     if (!recipient || recipient.status !== 'queued') {
@@ -132,8 +152,22 @@ const runBatch = async payload => {
         { jobId: `batch-${batchId}-retry-${Date.now()}`, delay: Math.max(1000, (limit.retryAfter || 5) * 1000) });
       return;
     }
-    try { await deliverOne({ organizationId, campaignId, recipientId, account, template, campaign }); }
-    catch (err) { /* SMTP may already have accepted the message: do not refund ambiguous reservations. */ await scoped('campaign_batches', ctx).updateOne({ _id: batchId }, { $set: { checkpoint: i, error: err.message } }); throw err; }
+    try {
+      const result = await deliverOne({ organizationId, campaignId, recipientId, account, template, campaign, sendPolicy });
+      if (result?.deferred) {
+        const retryAt = nextSendAt(sendPolicy, new Date());
+        await scoped('campaign_batches', ctx).updateOne({ _id: batchId },
+          { $set: { checkpoint: i, blockedAt: new Date().toISOString(), blockedReason: 'campaign_schedule' } });
+        await getQueue('campaign').add('campaign.batch', { ...payload, batchId },
+          { jobId: `batch-${batchId}-schedule-${Math.floor(Date.now() / 60000)}`,
+            delay: Math.max(1000, retryAt.getTime() - Date.now()) });
+        return;
+      }
+    } catch (err) {
+      await scoped('campaign_batches', ctx).updateOne({ _id: batchId },
+        { $set: { checkpoint: i, error: err.message } });
+      throw err;
+    }
     await scoped('campaign_batches', ctx).updateOne({ _id: batchId }, { $set: { checkpoint: i + 1 } });
   }
   await scoped('campaigns', ctx).updateOne({ _id: campaignId }, { $set: { accountState: state } });
@@ -180,11 +214,21 @@ export const startCampaignRunner = () => registerWorker('campaign', async (paylo
 
   // Fallback for events created before batching existed.
   let state = campaign.accountState || {};
-  for (const recipientId of recipientIds) {
+  for (let i = 0; i < recipientIds.length; i++) {
+    const recipientId = recipientIds[i];
     const { account, state: next } = selectAccount({ accounts, strategy: rotation, contactId: recipientId, state, stream });
     state = next;
     if (!account) continue;
-    await deliverOne({ organizationId, campaignId, recipientId, account, template, campaign });
+    const sendPolicy = pacingFor({ ...campaign, sendPolicy: payload.sendPolicy || campaign.sendPolicy });
+    const result = await deliverOne({ organizationId, campaignId, recipientId, account, template, campaign, sendPolicy });
+    if (result?.deferred) {
+      const retryAt = nextSendAt(sendPolicy, new Date());
+      await getQueue('campaign').add('campaign.execute',
+        { ...payload, recipientIds: recipientIds.slice(i), offset: (Number(payload.offset) || 0) + i },
+        { jobId: `campaign-${campaignId}-schedule-${Math.floor(Date.now() / 60000)}`,
+          delay: Math.max(1000, retryAt.getTime() - Date.now()) });
+      return;
+    }
   }
   await scoped('campaigns', ctx).updateOne({ _id: campaignId }, { $set: { accountState: state } });
 });

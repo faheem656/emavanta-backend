@@ -1,4 +1,4 @@
-import { z } from 'zod';
+﻿import { z } from 'zod';
 export const email = z.string().email().max(254).transform(v => v.toLowerCase().trim());
 export const password = z.string().min(12).max(128);
 export const registerSchema = z.object({ email, password, name: z.string().min(2).max(80), organization: z.string().min(2).max(80) });
@@ -19,7 +19,29 @@ export const sendPolicySchema = z.object({
   maxDelaySec: z.number().int().min(10).max(900).default(90),
   jitterPct: z.number().min(0).max(40).default(20),
   activeHours: z.object({ start: z.number().int().min(0).max(23).default(9), end: z.number().int().min(1).max(24).default(18) }).default({}),
-  timezone: z.string().default('UTC'),
+  timezone: z.string().default('UTC').refine(value => {
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: value });
+      return true;
+    } catch {
+      return false;
+    }
+  }, { message: 'timezone must be a valid IANA timezone' }),
+  schedule: z.object({
+    startTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'startTime must use HH:mm'),
+    endTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'endTime must use HH:mm'),
+    daysOfWeek: z.array(z.number().int().min(1).max(7)).min(1)
+      .refine(days => new Set(days).size === days.length, {
+        message: 'daysOfWeek must not contain duplicates'
+      })
+  }).optional().refine(schedule => {
+    if (!schedule) return true;
+    const toMinutes = value => {
+      const [hours, minutes] = value.split(':').map(Number);
+      return hours * 60 + minutes;
+    };
+    return toMinutes(schedule.startTime) < toMinutes(schedule.endTime);
+  }, { message: 'schedule endTime must be later than startTime' }),
   dailyCap: z.number().int().min(1).max(2000).default(50),
   weeklyCap: z.number().int().min(1).max(14000).default(250),
   weekend: z.boolean().default(false),
@@ -95,3 +117,4 @@ export const campaignDraftSchema = z.object({
 });
 export const apiKeySchema = z.object({ name: z.string().min(2), scopes: z.array(z.string()).min(1), expiresInDays: z.number().int().min(1).max(365).default(90), ipAllowlist: z.array(z.string()).default([]) });
 export const addonSchema = z.object({ code: z.string().min(2), quantity: z.number().int().min(1).max(20).default(1) });
+
