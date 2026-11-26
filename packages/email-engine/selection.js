@@ -2,15 +2,19 @@ import { ROTATION, ACCOUNT_STATUS } from '../shared/constants.js';
 import { stableHash } from '../shared/utils.js';
 
 export const eligibleAccounts = (accounts, { stream, now = new Date() } = {}) => (accounts || []).filter(a => {
-  if (a.status && a.status !== ACCOUNT_STATUS.ACTIVE) return false;
+  if (a.status && a.status !== ACCOUNT_STATUS.ACTIVE) {
+    // A mailbox in a provider cool-down becomes usable again the moment its
+    // limitedUntil passes (the sweep persists the flip back to `active`).
+    const until = a.limitedUntil ? Date.parse(a.limitedUntil) : NaN;
+    if (!(a.status === ACCOUNT_STATUS.LIMITED && Number.isFinite(until) && until <= now.getTime())) return false;
+  }
   if (a.stream && stream && a.stream !== stream) return false;
   if (a.dailyCap && (a.sentToday || 0) >= a.dailyCap) return false;
   if (a.warmup && stream !== 'transactional') return false;
   if (a.tokenExpiresAt && Date.parse(a.tokenExpiresAt) < Date.now()) return false;
-  if (a.activeHours && stream === 'outreach') {
-    const h = now.getUTCHours();
-    if (h < a.activeHours.start || h >= a.activeHours.end) return false;
-  }
+  // Note: per-mailbox activeHours were removed with the send-policy page — the
+  // schedule lives on the campaign (sendPolicy.schedule) and is enforced by the
+  // pacer/batch there, so limits exist in exactly one place.
   return true;
 });
 

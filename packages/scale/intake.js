@@ -51,10 +51,32 @@ export const intakeChunk = async ({
   const now = new Date().toISOString();
   const batchSize = Math.max(25, Math.min(500, streamConfig(stream).batchSize || 250));
 
-  const recipients = contacts.map(ct => ({
-    _id: `${campaignId}:${ct._id}`,
-    organizationId, campaignId, contactId: ct._id, email: ct.email, status: 'queued', createdAt: now
-  }));
+  // Never let an unsubscribed, bounced or suppressed address into the queue:
+  // it is stored as a PAUSED lead with the exact reason, and a "skipped" event
+  // makes that reason visible in the per-lead stream.
+  const emails = contacts.map(ct => String(ct.email || '').toLowerCase().trim()).filter(Boolean);
+  const supRows = emails.length
+    ? await scoped('suppressions', ctx).find({ email: { $in: emails }, status: { $ne: 'expired' } }, { limit: 5000 })
+    : [];
+  const supByEmail = new Map(supRows.map(s => [String(s.email || '').toLowerCase().trim(), s]));
+  const skipReasonFor = ct => {
+    if (ct.status === 'unsubscribed') return 'unsubscribed';
+    if (ct.status === 'bounced') return 'already_bounced';
+    const sup = supByEmail.get(String(ct.email || '').toLowerCase().trim());
+    if (!sup) return null;
+    const r = String(sup.reason || '').toLowerCase();
+    if (r.includes('unsub')) return 'unsubscribed';
+    if (r.includes('bounc')) return 'already_bounced';
+    return 'suppressed';
+  };
+  const recipients = contacts.map(ct => {
+    const reason = skipReasonFor(ct);
+    return {
+      _id: `${campaignId}:${ct._id}`,
+      organizationId, campaignId, contactId: ct._id, email: ct.email,
+      status: reason ? 'paused' : 'queued', ...(reason ? { reason } : {}), createdAt: now
+    };
+  });
 
   const batches = [];
   for (let i = 0; i < recipients.length; i += batchSize) {
@@ -68,21 +90,33 @@ export const intakeChunk = async ({
 
   // Deterministic event id as well as dedupeKey: a retried chunk must not add a second
   // "queued" row for the same recipient.
-  const events = recipients.map(r => ({
-    _id: `ev-queued-${r._id}`, organizationId, type: 'queued', dedupeKey: `queued:${r._id}`,
-    campaignId, contactId: r.contactId, email: r.email, createdAt: now
-  }));
+  const events = recipients.map(r => r.status === 'paused'
+    ? { _id: `ev-skipped-${r._id}`, organizationId, type: 'skipped', dedupeKey: `skipped:${r._id}`,
+        campaignId, contactId: r.contactId, email: r.email, note: r.reason || 'suppressed', createdAt: now }
+    : { _id: `ev-queued-${r._id}`, organizationId, type: 'queued', dedupeKey: `queued:${r._id}`,
+        campaignId, contactId: r.contactId, email: r.email, createdAt: now });
 
   const nextAfter = contacts[contacts.length - 1]._id;
   if (dryRun) return { added: recipients.length, offset, done: false, nextAfter, batchIds: batches.map(b => b._id) };
 
-  // Deterministic ids make every write an upsert: a retried chunk adds nothing twice.
-  await collection('campaign_recipients').bulkCreate(recipients);
-  await collection('campaign_batches').bulkCreate(batches);
+  // Re-running a chunk (pause → Launch again) must not clobber live rows: a full
+  // replace used to flip already-sent recipients back to `queued` and reset batch
+  // checkpoints, which re-sent the whole list. Only rows that do not exist yet
+  // are written; sent / paused statuses and finished batches survive a relaunch.
+  const existingIds = new Set((await collection('campaign_recipients')
+    .find({ _id: { $in: recipients.map(r => r._id) } }, { projection: { _id: 1 } })).map(r => r._id));
+  const freshRecipients = recipients.filter(r => !existingIds.has(r._id));
+  const existingBatches = new Set((await collection('campaign_batches')
+    .find({ _id: { $in: batches.map(b => b._id) } }, { projection: { _id: 1 } })).map(b => b._id));
+  const freshBatches = batches.filter(b => !existingBatches.has(b._id));
+  if (freshRecipients.length) await collection('campaign_recipients').bulkCreate(freshRecipients);
+  if (freshBatches.length) await collection('campaign_batches').bulkCreate(freshBatches);
   await collection('campaign_chunks').bulkCreate([{
     _id: `${campaignId}:${offset}`, organizationId, campaignId, offset, size: recipients.length, createdAt: now
   }]);
-  await collection('delivery_events').bulkCreate(events);
+  // Queued events exist once per recipient, ever — only new recipients get one.
+  const freshEvents = events.filter(e => !existingIds.has(String(e.dedupeKey || '').replace(/^(queued|skipped):/, '')));
+  if (freshEvents.length) await collection('delivery_events').bulkCreate(freshEvents);
 
   // The relay turns this event into batch jobs; the writers never touch the send queues.
   const { event } = await writeWithOutbox({

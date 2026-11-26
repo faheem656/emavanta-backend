@@ -19,7 +19,7 @@ const trackLinks = (html, tokenForUrl) => String(html || '')
     return `href=${quote}${escapeAttr(trackUrl(`/t/l/${tokenForUrl(url)}`))}${quote}`;
   });
 
-export const renderMessage = ({ template, recipient, account, campaign, organizationId, includeEmavantaBrand = false }) => {
+export const renderMessage = ({ template, recipient, account, campaign, organizationId, includeEmavantaBrand = false, tokenFallbacks, contact }) => {
   const org = organizationId || campaign.organizationId || campaign.org || 'demo-org';
   const campaignId = campaign._id || campaign.id;
   const recipientId = recipient._id || recipient.id || recipient.email;
@@ -36,8 +36,14 @@ export const renderMessage = ({ template, recipient, account, campaign, organiza
   const clickToken = url => signLink({ ...common, kind: 'l', url });
 
   const htmlRaw = template.mode === 'code' && template.html ? template.html : blocksToHtml(template.blocks, template.styles);
-  const ctx = { ...recipient, customFields: recipient.customFields || {},
+  // Personalization reads the CONTACT record (first name, company, custom
+  // fields). The recipient row only carries the address, so without `contact`
+  // every token fell back to the registry default — unpersonalized mail.
+  // Recipient wins on conflicts (it is the address we actually send to).
+  const ctx = { ...(contact || {}), ...recipient,
+    customFields: contact?.customFields || recipient.customFields || {},
     sender: { sender_name: account.fromName || account.fromEmail, senderName: account.fromName || account.fromEmail },
+    tokenFallbacks: tokenFallbacks || {},
     unsubscribe_url: unsubscribeUrl, unsubscribeUrl, unsubscribe: unsubscribeUrl };
   let html = sanitizeHtml(renderText(htmlRaw, ctx));
   html = trackLinks(html, clickToken);
@@ -47,7 +53,8 @@ export const renderMessage = ({ template, recipient, account, campaign, organiza
   }
   const pixel = `<img src="${escapeAttr(openUrl)}" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0" />`;
   html = /<\/body\s*>/i.test(html) ? html.replace(/<\/body\s*>/i, `${pixel}</body>`) : `${html}${pixel}`;
-  const subject = renderText(template.subject, ctx);
+  // Subjects are plain text — never HTML-escape names there ("O'Brien", not "O&#39;Brien").
+  const subject = renderText(template.subject, ctx, { html: false });
 
   return {
     id: messageId,

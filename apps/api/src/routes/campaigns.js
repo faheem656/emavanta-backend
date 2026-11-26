@@ -1,7 +1,7 @@
 import { effectiveAddons } from '../../../../packages/entitlements/definitions.js';
 import { scoped, collection, nativeDatabase, isMemoryMode } from '../../../../packages/database/store.js';
 import { assertPermission, PERMISSIONS, canAccessWorkspace } from '../../../../packages/security/rbac.js';
-import { campaignSchema, campaignDraftSchema } from '../../../../packages/validation/index.js';
+import { campaignSchema, campaignDraftSchema, campaignPacingSchema } from '../../../../packages/validation/index.js';
 import { pacingFor, estimate } from '../../../../packages/email-engine/cadence.js';
 import { blocksToHtml } from '../../../../packages/email-engine/template.js';
 import { preflight } from '../../../../packages/email-engine/preflight.js';
@@ -14,28 +14,11 @@ import { streamConfig, throughputFor } from '../../../../packages/deliverability
 import { newId, stableHash } from '../../../../packages/shared/utils.js';
 import { badRequest, notFound, tooMany } from '../../../../packages/shared/errors.js';
 import { audit } from '../plugins/audit.js';
+import { fanoutBlastBatches, tokenFallbacksFor } from '../workers/campaignRunner.js';
 import { whiteLabelFor } from '../../../../packages/entitlements/branding.js';
 import { renderMessage } from '../../../../packages/email-engine/render.js';
 import { sendMessage } from '../../../../packages/providers/index.js';
-
-/** A campaign may send only from its explicitly selected, organization-scoped, verified mailbox pool. */
-const selectedSenderPool = async (ctx, campaign) => {
-  const ids = Array.isArray(campaign.accountPool) ? campaign.accountPool : [];
-  if (!ids.length) throw badRequest('Select at least one verified sending mailbox before launch.');
-  const uniqueIds = [...new Set(ids)];
-  if (uniqueIds.length !== ids.length) throw badRequest('Remove duplicate mailboxes from the sender pool.');
-  const accounts = await scoped('sending_accounts', ctx).find({ _id: { $in: uniqueIds } });
-  if (accounts.length !== uniqueIds.length) throw badRequest('One or more selected mailboxes is unavailable in this workspace.');
-  const now = Date.now();
-  const invalid = accounts.some(account => account.status !== 'active'
-    || (account.authMethod === 'mock' && process.env.NODE_ENV !== 'test')
-    || (account.tokenExpiresAt && (!Number.isFinite(Date.parse(account.tokenExpiresAt)) || Date.parse(account.tokenExpiresAt) <= now))
-    || !canAccessWorkspace(ctx, account.workspaceId));
-  if (invalid) throw badRequest('Every selected mailbox must be active, verified, and accessible. Reconnect or remove any mailbox that needs attention.');
-  if (accounts.some(account => account.stream && account.stream !== campaign.stream))
-    throw badRequest(`Every selected mailbox must support the ${campaign.stream} stream. Update the pool or mailbox stream.`);
-  return accounts;
-};
+import { launchCampaign, scheduleLaunch, cancelSchedule, selectedSenderPool } from '../services/campaignLaunch.js';
 
 export default async function campaignRoutes(app) {
   app.get('/campaigns', async req => scoped('campaigns', req.ctx).find({}, { sort: { createdAt: -1 } }));
@@ -79,6 +62,7 @@ export default async function campaignRoutes(app) {
   app.post('/campaigns', async req => {
     assertPermission(req.ctx, PERMISSIONS.CAMPAIGNS_WRITE);
     const input = campaignSchema.parse(req.body);
+    // Default stays human-paced; an explicit blast choice is honoured on any stream.
     const campaign = await scoped('campaigns', req.ctx).create({ _id: newId(), ...input, status: 'draft',
       sendMode: input.sendMode || 'human', gapSeconds: input.gapSeconds,
       accountSelection: { rotation: input.rotation, stickyByContact: input.rotation === 'sticky_by_contact' },
@@ -95,11 +79,77 @@ export default async function campaignRoutes(app) {
     if (c.status !== 'draft') throw badRequest('Only draft campaigns can be edited');
     const input = campaignSchema.parse(req.body);
     const result = await scoped('campaigns', req.ctx).updateOne({ _id: c._id, status: 'draft' }, { $set: {
-      ...input, accountSelection: { rotation: input.rotation, stickyByContact: input.rotation === 'sticky_by_contact' }
+      ...input, sendMode: input.sendMode || 'human',
+      accountSelection: { rotation: input.rotation, stickyByContact: input.rotation === 'sticky_by_contact' }
     }, ...(input.startAt ? {} : { $unset: { startAt: '' } }) });
     if (!result.matchedCount) throw badRequest('Campaign is no longer a draft');
     // startAt is intentionally not supported until scheduled launch exists.
-    return { ...c, ...input, status: 'draft' };
+    return { ...c, ...input, sendMode: input.sendMode || 'human', status: 'draft' };
+  });
+
+  /**
+   * Live pacing edits: mode, daily cap, pause between emails, schedule, timezone.
+   * Allowed while the campaign is queued/paused — the pacer reloads the campaign
+   * document on every tick, so the new numbers apply to the very next email.
+   * Flipping to blast hands the remaining batches to the fast path immediately.
+   */
+  app.patch('/campaigns/:id/pacing', async req => {
+    assertPermission(req.ctx, PERMISSIONS.CAMPAIGNS_WRITE);
+    const c = await scoped('campaigns', req.ctx).findOne({ _id: req.params.id });
+    if (!c) throw notFound('Campaign not found');
+    const input = campaignPacingSchema.parse(req.body || {});
+    const { gapSeconds, sendMode, ...policyUpdate } = input;
+    const $set = { sendPolicy: { ...(c.sendPolicy || {}), ...policyUpdate } };
+    if (gapSeconds !== undefined) $set.gapSeconds = gapSeconds;
+    if (sendMode !== undefined) $set.sendMode = sendMode;
+    await scoped('campaigns', req.ctx).updateOne({ _id: c._id }, { $set });
+    const updated = { ...c, ...$set, sendPolicy: $set.sendPolicy };
+    const pacing = pacingFor(updated);
+    const mode = updated.sendMode || 'human';
+    const pace = estimate({ recipients: 0, mode,
+      gapSeconds: updated.gapSeconds || pacing.minDelaySec, dailyCap: pacing.dailyCap });
+    // Mode switch while running: blast drains now, human re-arms the pacer.
+    let handedOff = 0;
+    if (mode === 'blast' && (c.sendMode || 'human') !== 'blast' && ['queued', 'paused'].includes(c.status)) {
+      handedOff = await fanoutBlastBatches({ organizationId: req.ctx.organizationId, campaign: updated });
+    } else if (mode === 'human' && c.sendMode === 'blast' && c.status === 'queued') {
+      await getQueue('outreach').add('outreach.pacer', {
+        organizationId: req.ctx.organizationId, campaignId: c._id,
+        accountPool: updated.accountPool || [], rotation: updated.rotation,
+        stream: updated.stream, sendPolicy: pacing
+      }, { jobId: `pacer-${c._id}`, replace: true });
+    }
+    await audit(req.ctx, 'campaign.pacing_update', 'campaign',
+      { sendMode: mode, dailyCap: pacing.dailyCap, gapSeconds: updated.gapSeconds ?? null,
+        timezone: pacing.timezone || null, handedOff });
+    return { ok: true, sendMode: mode, sendPolicy: pacing, gapSeconds: updated.gapSeconds ?? c.gapSeconds ?? null,
+      pace, handedOff,
+      message: mode === 'blast'
+        ? (handedOff ? `Blast on — ${handedOff} batch(es) draining now.` : 'Blast mode saved.')
+        : 'Pacing updated — the next email already uses the new limit.' };
+  });
+
+  /**
+   * Swap the sender mailboxes of a campaign that is already running or paused.
+   * The pacer and the batch runner read the LIVE pool on every tick, so the very
+   * next email goes from the new mailbox set — no pause, no relaunch.
+   */
+  app.patch('/campaigns/:id/senders', async req => {
+    assertPermission(req.ctx, PERMISSIONS.CAMPAIGNS_WRITE);
+    const c = await scoped('campaigns', req.ctx).findOne({ _id: req.params.id });
+    if (!c) throw notFound('Campaign not found');
+    if (!['queued', 'paused'].includes(c.status)) throw badRequest('Only running or paused campaigns can change senders mid-flight.');
+    const ids = [...new Set((Array.isArray(req.body?.accountPool) ? req.body.accountPool : []).map(String))];
+    if (!ids.length) throw badRequest('Pick at least one mailbox.');
+    const updated = { ...c, accountPool: ids };
+    // Same rules as launch: active, verified, in this workspace.
+    await selectedSenderPool(req.ctx, updated);
+    const result = await scoped('campaigns', req.ctx).updateOne({ _id: c._id, status: c.status },
+      { $set: { accountPool: ids } });
+    if (!result.matchedCount) throw badRequest('Campaign status changed; refresh and try again.');
+    await audit(req.ctx, 'campaign.senders_update', 'campaign', { id: c._id, accountPool: ids });
+    return { ok: true, accountPool: ids,
+      message: `Sender pool updated — the next email goes from ${ids.length} mailbox(es).` };
   });
 
   app.get('/campaigns/:id', async req => {
@@ -137,7 +187,15 @@ export default async function campaignRoutes(app) {
     const summary = Object.fromEntries(types.map(t => [t, events.filter(e => e.type === t).length]));
     const n = (a, b) => b ? Math.round((a / b) * 1000) / 10 : 0;
     const sent = (summary.sent || 0) + (summary.test_sent || 0) || campaign.stats?.sent || 0;
-    const delivered = (summary.delivered || 0) + (summary.test_delivered || 0) || campaign.stats?.delivered || 0;
+    const explicitDelivered = (summary.delivered || 0) + (summary.test_delivered || 0);
+    const statsDelivered = Number(campaign.stats?.delivered || 0);
+    // SMTP/IMAP mailboxes never report delivery receipts, so "delivered" stayed
+    // at 0 forever. When the provider has sent zero delivery events, fall back
+    // to sent − bounced (the industry-standard estimate). Providers that DO
+    // report keep their exact numbers.
+    const deliveryEstimated = !explicitDelivered && !statsDelivered && sent > 0;
+    const delivered = explicitDelivered || statsDelivered
+      || (sent > 0 ? Math.max(0, sent - (summary.bounced || 0)) : 0);
     const percentages = {
       delivery: n(delivered, sent),
       open: n(summary.opened, delivered),
@@ -154,14 +212,36 @@ export default async function campaignRoutes(app) {
       timeline[day] ||= Object.fromEntries(types.map(t => [t, 0]));
       if (timeline[day][e.type] !== undefined) timeline[day][e.type]++;
     }
+    if (deliveryEstimated) {
+      summary.delivered = delivered; // the card reads summary, not the percentages
+      for (const day of Object.values(timeline)) {
+        day.delivered = Math.max(0, (day.sent || 0) - (day.bounced || 0));
+      }
+    }
     const byAccount = {};
     for (const e of events) {
       if (!e.sendingAccountId) continue;
       byAccount[e.sendingAccountId] ||= { sent: 0, delivered: 0, opened: 0, clicked: 0, bounced: 0 };
       if (byAccount[e.sendingAccountId][e.type] !== undefined) byAccount[e.sendingAccountId][e.type]++;
     }
+    if (deliveryEstimated) {
+      // Same sent − bounced estimate per mailbox when the provider reports nothing.
+      for (const row of Object.values(byAccount)) row.delivered = Math.max(0, (row.sent || 0) - (row.bounced || 0));
+    }
     const problems = events.filter(e => ['bounced','complained','unsubscribed','deferred'].includes(e.type)).slice(0, 100);
+    // Why isn't it sending? A parked batch reason + the health of this campaign's
+    // mailbox pool, so the page can say it plainly instead of "just queued".
+    const openBatch = await scoped('campaign_batches', req.ctx)
+      .findOne({ campaignId: campaign._id, status: { $ne: 'done' } });
+    const poolIds = Array.isArray(campaign.accountPool) ? campaign.accountPool : [];
+    const mailboxIssues = accounts
+      .filter(a => (!poolIds.length || poolIds.includes(a._id)) && a.status && a.status !== 'active')
+      .map(a => ({ fromEmail: a.fromEmail, status: a.status,
+        lastError: a.lastError || null, limitedUntil: a.limitedUntil || null }));
+    const blocked = openBatch?.blockedReason
+      ? { reason: openBatch.blockedReason, at: openBatch.blockedAt || null } : null;
     return { campaign, summary, percentages, timeline, events, reviewNeeded, recipients: recipients.length,
+      deliveryEstimated, blocked, mailboxIssues,
       byAccount: Object.fromEntries(await Promise.all(Object.entries(byAccount).map(async ([id, v]) => [
         accounts.find(a => a._id === id)?.fromEmail || id, v
       ]))), problems };
@@ -190,10 +270,14 @@ export default async function campaignRoutes(app) {
     if (req.body.accountId && !accounts.some(a => a._id === req.body.accountId))
       throw badRequest('Choose a mailbox from this campaign’s selected sender pool.');
     const account = req.body.accountId ? accounts.find(a => a._id === req.body.accountId) : accounts[0];
-    const recipient = { _id: `test-${stableHash('recipient', c._id, to)}`, email: to,
-      firstName: 'Test', lastName: '', company: 'Test preview', customFields: {} };
+    const recipient = { _id: `test-${stableHash('recipient', c._id, to)}`, email: to };
+    // Real contact data when the test address exists in the workspace — the
+    // test then shows exactly what a personalized send looks like.
+    const contact = await scoped('contacts', req.ctx).findOne({ email: to })
+      || { firstName: 'Test', lastName: '', company: 'Test preview', customFields: {} };
     const org=await collection('organizations').findOne({_id:req.ctx.organizationId});
-    const message = renderMessage({ template, recipient, account, campaign: c, organizationId: req.ctx.organizationId, includeEmavantaBrand: !whiteLabelFor(org) });
+    const message = renderMessage({ template, recipient, account, campaign: c, organizationId: req.ctx.organizationId,
+      includeEmavantaBrand: !whiteLabelFor(org), tokenFallbacks: await tokenFallbacksFor(req.ctx), contact });
     const tp=throughputFor(org?.plan||'growth'), stream=c.stream||'marketing';
     const limit=await acquireStream({organizationId:req.ctx.organizationId,stream,accountId:account._id,domain:String(account.fromEmail||'').split('@')[1]||'unknown',
       streamCapacity:stream==='outreach'?60:tp.burst,streamRefill:stream==='outreach'?1:tp.refillPerSec,
@@ -219,85 +303,18 @@ export default async function campaignRoutes(app) {
     assertPermission(req.ctx, PERMISSIONS.CAMPAIGNS_SEND);
     const c = await scoped('campaigns', req.ctx).findOne({ _id: req.params.id });
     if (!c) throw notFound('Campaign not found');
-    if (!['draft','paused'].includes(c.status)) throw badRequest(`Campaign is ${c.status}`);
-    if (c.startAt && Date.parse(c.startAt) > Date.now()) throw badRequest('Scheduled launch is not supported yet. Launch when you are ready.');
-    const senderPool = await selectedSenderPool(req.ctx, c);
-    const template = await scoped('templates', req.ctx).findOne({ _id: c.templateId });
-    if (!template) throw badRequest('Template missing');
-    const html = template.mode === 'code' ? template.html : blocksToHtml(template.blocks, template.styles);
-    const check = preflight({ subject: template.subject, html, tokens: {}, unsubscribeUrl: `https://track.emavanta.com/u/${c._id}` });
-    if (!check.ok) throw badRequest('Preflight failed', { issues: check.issues });
+    if (!['draft','paused','scheduled'].includes(c.status)) throw badRequest(`Campaign is ${c.status}`);
+    // Explicit startAt → arm a scheduled launch instead of sending now.
+    if (req.body?.startAt) return scheduleLaunch(req.ctx, c, req.body.startAt);
+    return launchCampaign(req.ctx, c, { confirm: req.body?.confirm === true, traceId: req.id });
+  });
 
-    // The audience is counted, never loaded. At a million contacts this is one indexed count.
-    const listIds = c.listIds || [];
-    const total = await countAudience({ organizationId: req.ctx.organizationId, listIds });
-    if (!total) throw badRequest('No contacts in selected lists');
-
-    const org = await collection('organizations').findOne({ _id: req.ctx.organizationId });
-    const plan = req.ctx.demo ? 'growth' : org?.plan || 'free';
-    const cycle = org?.cycle || new Date().toISOString().slice(0,7);
-    const addons = effectiveAddons(org);
-    // Usage ledger: one row per org+cycle. It is the number the user sees in Billing,
-    // and it survives restarts (a token bucket in memory used to drift and lie).
-    const ledgerId = usageLedgerId(req.ctx.organizationId, cycle);
-    if(!isMemoryMode()) {
-      await nativeDatabase().collection('usage_counters').updateOne({_id:ledgerId},{$setOnInsert:{organizationId:req.ctx.organizationId,cycle,sends:0}},{upsert:true});
-    }
-    const ledger = await collection('usage_counters').findOne({ _id: ledgerId })
-      || await collection('usage_counters').create({ _id: ledgerId, organizationId: req.ctx.organizationId, cycle, sends: 0 });
-    const used = { ...(req.ctx.usage || {}), sends: Math.max(Number(ledger.sends || 0), await scoped('messages', req.ctx).countDocuments({})) };
-    // Preview first: it must not eat allowance. Tokens are only reserved on confirm.
-    const preview = checkQuota({ plan, addons, dimension: 'sends', quantity: total, used });
-    if (!preview.ok) throw badRequest(
-      `This plan allows ${preview.limit.toLocaleString()} sends per cycle and ${total.toLocaleString()} contacts are selected. `
-      + 'Buy a send add-on or split the campaign into smaller audiences.', { quota: preview, total });
-
-    const throughput = throughputFor(req.ctx.demo ? 'growth' : plan);
-    const pacing = pacingFor(c);
-    const pace = estimate({ recipients: total, mode: c.sendMode || 'human',
-      gapSeconds: c.gapSeconds || pacing.minDelaySec, dailyCap: pacing.dailyCap,
-      perBatch: streamConfig(c.stream).batchSize });
-    if (req.body.confirm !== true) return { requiresConfirmation: true, recipients: total,
-      accounts: senderPool.length, stream: c.stream, quota: preview, sendMode: c.sendMode || 'human',
-      pace, batchSize: streamConfig(c.stream).batchSize, intakeChunk: INTAKE_CHUNK, throughput,
-      note: 'Recipients are copied in the background in chunks of ' + INTAKE_CHUNK.toLocaleString() + ', so the launch returns immediately.' };
-
-    // Backpressure: a huge standing backlog defers intake instead of melting the queue.
-    const pending = await getQueue('campaign').getJobCounts();
-    if (!req.ctx.demo && pending.waiting > 10_000) return { status: 'scheduled', retryAfter: 300,
-      message: 'Queue above SLO threshold; campaign intake deferred. Your campaign is unchanged.' };
-
-    const quota = reserve({ plan, addons, dimension: 'sends', quantity: total, used });
-    if (!quota.ok) throw badRequest(
-      `The send allowance ran out while launching ${total.toLocaleString()} contacts. Nothing was queued — buy a send add-on and launch again.`,
-      { quota, total });
-    // Atomic conditional increment: parallel launches cannot both reserve the
-    // same remaining allowance. Preserve legacy message counts conservatively.
-    if(!isMemoryMode()) await nativeDatabase().collection('usage_counters').updateOne({_id:ledgerId},{$max:{sends:used.sends}});
-    const filter={_id:ledgerId,...(quota.limit<0?{}:{sends:{$lte:quota.limit-total}})};
-    const reservation=await collection('usage_counters').updateOne(filter,{$inc:{sends:total}});
-    if(!reservation.matchedCount)throw badRequest('The send allowance ran out while launching. Nothing was queued.',{quota,total});
-
-    const now = new Date().toISOString();
-    const changed=await scoped('campaigns', req.ctx).updateOne({ _id: c._id, status:c.status }, { $set: {
-      status: 'queued', queuedAt: now,
-      intake: { status: 'running', done: 0, total, chunkSize: INTAKE_CHUNK, startedAt: now }
-    } });
-    if(!changed.matchedCount){await collection('usage_counters').updateOne({_id:ledgerId},{$inc:{sends:-total}});throw badRequest('This campaign was already launched.');}
-
-    // One small job kicks off the first chunk; the intake worker reschedules itself.
-    await getQueue('campaign_intake').add('campaign.intake', {
-      organizationId: req.ctx.organizationId, campaignId: c._id, listIds, offset: 0,
-      limit: INTAKE_CHUNK, accountPool: c.accountPool, rotation: c.rotation,
-      stream: c.stream, sendMode: c.sendMode || 'human', gapSeconds: c.gapSeconds,
-      sendPolicy: pacing, traceId: req.id
-    }, { jobId: `intake-${c._id}-0` });
-
-    await audit(req.ctx, 'campaign.launch', 'campaign', { recipients: total, chunkSize: INTAKE_CHUNK });
-    return { ok: true, campaignId: c._id, queued: total, status: 'queued',
-      intake: { status: 'running', done: 0, total, chunkSize: INTAKE_CHUNK },
-      sendMode: c.sendMode || 'human', pace,
-      message: `Launching to ${total.toLocaleString()} contacts in chunks of ${INTAKE_CHUNK.toLocaleString()}. Sending starts immediately; you can watch progress on this page.` };
+  /** Cancel a scheduled launch — back to draft (or paused if it had launched before). */
+  app.delete('/campaigns/:id/schedule', async req => {
+    assertPermission(req.ctx, PERMISSIONS.CAMPAIGNS_WRITE);
+    const c = await scoped('campaigns', req.ctx).findOne({ _id: req.params.id });
+    if (!c) throw notFound('Campaign not found');
+    return cancelSchedule(req.ctx, c);
   });
 
   /** Live counters for the launch banner — counts only, no row loading. */

@@ -26,6 +26,23 @@ const record = async (d, type, extra = {}) => {
   if (d.campaignId && ['opened', 'clicked', 'unsubscribed', 'delivered'].includes(type)) {
     await collection('campaigns').updateOne({ _id: d.campaignId }, { $inc: { [`stats.${type}`]: 1 } });
   }
+  // Behaviour entry triggers: "this contact opened/clicked → start matching workflows".
+  if (type === 'opened' || type === 'clicked') {
+    try {
+      const email = String(d.email || '').toLowerCase().trim();
+      const contact = email
+        ? await collection('contacts').findOne({ organizationId: d.org, email, deleted: { $ne: true } })
+        : null;
+      if (contact?._id) {
+        const { recordAutomationTriggers, publishAutomationTriggerEvents } =
+          await import('../../../../packages/automations/triggers.js');
+        const res = await recordAutomationTriggers({ organizationId: d.org,
+          trigger: type === 'opened' ? 'email_opened' : 'email_clicked',
+          contactId: contact._id, listIds: contact.listIds || [], source: `email_${type}` });
+        if (res?.eventIds?.length) await publishAutomationTriggerEvents(res.eventIds);
+      }
+    } catch { /* publication retried by the scheduler sweep */ }
+  }
   return true;
 };
 
@@ -61,6 +78,11 @@ export default async function trackingRoutes(app) {
     await scoped('suppressions', { organizationId: d.org }).create({ _id: newId(), email: d.email,
       reason: scope === 'all' ? 'unsubscribe_all' : 'unsubscribe', campaignId: d.campaignId,
       createdAt: new Date().toISOString() });
+    // Constant-Contact-style: the CONTACT itself flips to unsubscribed, not just
+    // the recipient row — visible on the contacts page forever after.
+    await scoped('contacts', { organizationId: d.org }).updateOne(
+      { email: String(d.email || '').toLowerCase().trim() },
+      { $set: { status: 'unsubscribed', unsubscribedAt: new Date().toISOString() } });
     if (d.contactId && d.campaignId) {
       await scoped('campaign_recipients', { organizationId: d.org }).updateOne({ _id: d.contactId },
         { $set: { status: 'paused', reason: 'unsubscribed' } });
@@ -75,6 +97,9 @@ export default async function trackingRoutes(app) {
     await record(d, 'unsubscribed', { scope: 'all' });
     await scoped('suppressions', { organizationId: d.org }).create({ _id: newId(), email: d.email,
       reason: 'unsubscribe_all', createdAt: new Date().toISOString() });
+    await scoped('contacts', { organizationId: d.org }).updateOne(
+      { email: String(d.email || '').toLowerCase().trim() },
+      { $set: { status: 'unsubscribed', unsubscribedAt: new Date().toISOString() } });
     return reply.type('text/html').send(unsubscribePage(d, true, '', await brandFor(d)));
   });
 

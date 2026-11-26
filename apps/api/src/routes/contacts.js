@@ -1,6 +1,6 @@
 import { scoped } from '../../../../packages/database/store.js';
 import { assertPermission, PERMISSIONS } from '../../../../packages/security/rbac.js';
-import { contactSchema } from '../../../../packages/validation/index.js';
+import { contactSchema, normalizeContactRow } from '../../../../packages/validation/index.js';
 import { newId, stableHash } from '../../../../packages/shared/utils.js';
 import { badRequest, notFound } from '../../../../packages/shared/errors.js';
 import { getQueue } from '../../../../packages/queue/index.js';
@@ -33,9 +33,9 @@ export default async function contactRoutes(app) {
 
   app.post('/contacts', async req => {
     assertPermission(req.ctx, PERMISSIONS.CONTACTS_WRITE);
-    const input = contactSchema.parse(req.body);
+    const input = contactSchema.parse(normalizeContactRow(req.body));
     input.listIds = await validLists(req.ctx, input.listIds);
-    const result=await createContacts(req.ctx,[input]);
+    const result=await createContacts(req.ctx,[{ ...input, consentIp: req.ip }]);
     const contact=result.created[0] || await scoped('contacts',req.ctx).findOne({email:input.email.toLowerCase().trim(),deleted:{$ne:true}});
     return { ...contact, existing: !result.created.length, addedToLists: result.addedToLists };
   });
@@ -99,13 +99,15 @@ export default async function contactRoutes(app) {
     const now = new Date().toISOString();
     const docs = [];
     let skipped = 0;
-    for (const row of rows) {
+    for (const row of rows.map(normalizeContactRow)) {
       const email = String(row.email || '').trim().toLowerCase();
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { skipped += 1; continue; }
       docs.push({ _id: stableHash(req.ctx.organizationId, email), organizationId: req.ctx.organizationId,
         email, firstName: row.firstName || '', lastName: row.lastName || '', company: row.company || '',
+        customFields: row.customFields || {},
         tags:Array.isArray(row.tags)?[...new Set(row.tags.filter(x=>typeof x==='string').map(x=>x.trim()).filter(x=>x&&x.length<=80))].slice(0,50):[],
         listIds: Array.isArray(row.listIds) ? row.listIds : [], dedupeKey: stableHash(req.ctx.organizationId, email),
+        consentSource: 'import', consentIp: req.ip,
         createdAt: now, updatedAt: now });
     }
     const result=await createContacts(req.ctx,docs);
@@ -136,15 +138,15 @@ export default async function contactRoutes(app) {
     if ((req.body.immediate === true && rows.length <= 2000) || rows.length <= 500) {
       let skipped = 0; const valid=[];
       for (const row of rows) {
-        const parsed = contactSchema.safeParse({ ...row, listIds: [...new Set([...(row.listIds || []), ...listIds])] });
+        const parsed = contactSchema.safeParse({ ...normalizeContactRow(row), listIds: [...new Set([...(row.listIds || []), ...listIds])] });
         if (!parsed.success) { skipped++; continue; }
-        valid.push(parsed.data);
+        valid.push({ ...parsed.data, consentSource: 'import', consentIp: req.ip });
       }
       const result=await createContacts(req.ctx,valid);
       return { accepted: rows.length, created: result.created.length, existing: result.duplicates, addedToLists: result.addedToLists, restored: result.restored, invalid: skipped, skipped, job: 'done' };
     }
     const q = getQueue('import');
-    await q.add('csv-import', { organizationId: req.ctx.organizationId, rows, listIds },
+    await q.add('csv-import', { organizationId: req.ctx.organizationId, rows, listIds, consentIp: req.ip },
       { jobId: newId() });
     return { accepted: rows.length, job: 'queued' };
   });

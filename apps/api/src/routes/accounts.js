@@ -1,10 +1,11 @@
 import { scoped, collection } from '../../../../packages/database/store.js';
 import { assertPermission, PERMISSIONS, canAccessWorkspace } from '../../../../packages/security/rbac.js';
 import { createOAuthState, googleAuthUrl, microsoftAuthUrl, exchangeCode } from '../../../../packages/security/oauth.js';
-import { encryptCredentials } from '../../../../packages/providers/index.js';
+import { encryptCredentials, decryptCredentials } from '../../../../packages/providers/index.js';
 import { newId } from '../../../../packages/shared/utils.js';
 import { badRequest, notFound, forbidden, tooMany } from '../../../../packages/shared/errors.js';
 import { acquireStream } from '../../../../packages/rate-limiter/index.js';
+import { cooldownUntil, classifySendError } from '../../../../packages/deliverability/index.js';
 import { config } from '../config.js';
 import { audit } from '../plugins/audit.js';
 
@@ -134,45 +135,53 @@ export default async function accountRoutes(app) {
       await scoped('sending_accounts', req.ctx).updateOne({ _id: acc._id }, { $set: { status: 'active' } });
       return { ok: true };
     } catch (e) {
-      await scoped('sending_accounts', req.ctx).updateOne({ _id: acc._id },
-        { $set: { status: e.code === 'REAUTH_REQUIRED' ? 'reauth_required' : 'limited', lastError: e.message } });
-      throw badRequest('Verification email could not be sent. Check the mailbox configuration.');
+      // 535-style login failures demand a reconnect (nothing was sent); anything
+      // else cools the mailbox down with a deadline it recovers from by itself.
+      const auth = e.code === 'REAUTH_REQUIRED' || classifySendError(e) === 'auth';
+      await scoped('sending_accounts', req.ctx).updateOne({ _id: acc._id }, { $set: {
+        status: auth ? 'reauth_required' : 'limited',
+        ...(auth ? {} : { limitedUntil: cooldownUntil(e.message) }),
+        lastError: e.message
+      } });
+      throw badRequest(`Verification email could not be sent: ${e.message}`);
     }
+  });
+
+  /**
+   * Reconnect an SMTP mailbox after an auth failure (535): the user pastes the
+   * new password, we probe the server for real, and the mailbox goes straight
+   * back to `active` — campaigns resume by themselves on the next tick.
+   */
+  app.post('/accounts/:id/reconnect', async req => {
+    assertPermission(req.ctx, PERMISSIONS.ACCOUNTS_CONNECT);
+    const acc = await scoped('sending_accounts', req.ctx).findOne({ _id: req.params.id });
+    if (!acc || !canAccessWorkspace(req.ctx, acc.workspaceId)) throw notFound('Account not found');
+    if (acc.authMethod !== 'smtp') throw badRequest('Reconnect this mailbox with its provider (OAuth).');
+    const pass = String(req.body?.pass || '');
+    if (!pass) throw badRequest('Enter the mailbox password or app password.');
+    const creds = decryptCredentials(acc.encryptedCredentials) || {};
+    const next = { ...creds, pass };
+    const { testSmtp } = await import('../../../../packages/providers/smtp.js');
+    try {
+      await testSmtp({ credentials: { host: next.host, port: next.port || 587,
+        secure: !!next.secure, user: next.user, pass: next.pass } });
+    } catch (e) { throw badRequest(`Mail server rejected the credentials: ${e.message}`); }
+    await scoped('sending_accounts', req.ctx).updateOne({ _id: acc._id }, { $set: {
+      encryptedCredentials: encryptCredentials(next), status: 'active',
+      lastError: null, limitedUntil: null
+    } });
+    await audit(req.ctx, 'account.reconnect', 'sending_account', { id: acc._id });
+    return { ok: true, message: `${acc.fromEmail} is back online — sending resumes automatically.` };
   });
 
   /**
    * Edit the limits of a connected mailbox (send policy page). Only the fields the
    * user can reason about are accepted — credentials are never editable here.
    */
-  app.patch('/accounts/:id', async req => {
-    assertPermission(req.ctx, PERMISSIONS.ORG_SETTINGS);
-    const account = await scoped('sending_accounts', req.ctx).findOne({ _id: req.params.id });
-    if (!account) throw notFound('Mail account not found');
-    const set = {};
-    if (req.body.dailyCap !== undefined) {
-      const cap = Number(req.body.dailyCap);
-      if (!Number.isFinite(cap) || cap < 1 || cap > 200000) throw badRequest('Daily cap must be between 1 and 200,000');
-      set.dailyCap = Math.round(cap);
-    }
-    if (req.body.stream !== undefined) set.stream = String(req.body.stream);
-    if (req.body.activeHours !== undefined) set.activeHours = req.body.activeHours;
-    if (!Object.keys(set).length) throw badRequest('Nothing to update — send dailyCap, stream or activeHours');
-    await scoped('sending_accounts', req.ctx).updateOne({ _id: account._id }, { $set: set });
-    await audit(req.ctx, 'account.update', 'sending_account', { id: account._id, ...set });
-    return { ok: true, account: { ...account, ...set } };
-  });
-
   app.delete('/accounts/:id', async req => {
     await scoped('sending_accounts', req.ctx).deleteOne({ _id: req.params.id });
     await audit(req.ctx, 'account.disconnect', 'sending_account', {});
     return { ok: true };
   });
 
-  app.post('/accounts/selection-preview', async req => {
-    const { eligibleAccounts } = await import('../../../../packages/email-engine/selection.js');
-    const all = await scoped('sending_accounts', req.ctx).find({});
-    const pool = eligibleAccounts(all, { stream: req.body.stream || 'outreach' });
-    return { eligible: pool.length, accounts: pool.map(a => ({ id: a._id, fromEmail: a.fromEmail,
-      sentToday: a.sentToday || 0, dailyCap: a.dailyCap, warmup: a.warmup })) };
-  });
 }

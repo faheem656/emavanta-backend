@@ -29,6 +29,63 @@ export const throughputFor = (plan = 'growth') => {
     refillPerSec: Math.max(0.5, Math.round((perHour / 3600) * 100) / 100) };
 };
 
+/**
+ * Provider cooling-off windows come back in the error text itself:
+ * "…will not be allowed to send emails till [time=2026-11-25 23:36:48 UTC]".
+ * Honour the provider's own clock when it gives one; otherwise back off an hour.
+ * Used to set `limitedUntil` so a limited mailbox resumes BY ITSELF.
+ */
+export const cooldownUntil = (message = '', from = Date.now()) => {
+  const m = String(message).match(/\[time=(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\s*UTC\]/i);
+  if (m) {
+    const t = Date.parse(`${m[1].replace(' ', 'T')}Z`);
+    if (Number.isFinite(t) && t > from) return new Date(t).toISOString();
+  }
+  return new Date(from + 3600_000).toISOString();
+};
+
+/** Providers typically hard-block a mailbox at 5 bounces/hour — mirror that proactively. */
+export const BOUNCE_AUTO_LIMIT = 5;
+
+/**
+ * Campaign circuit breaker: once a campaign has sent enough to be meaningful
+ * (≥ minSent) its bounce rate crossing `rate` pauses the WHOLE campaign for
+ * review — the industry-standard protection for a sender's reputation.
+ */
+export const BOUNCE_PAUSE = Object.freeze({ rate: 0.05, minSent: 20 });
+
+/**
+ * Classify a send failure so the system reacts correctly instead of guessing:
+ *  - 'auth'     → the mailbox cannot log in (535/credentials): NOTHING was sent,
+ *                  keep the recipient queued and demand a reconnect;
+ *  - 'account'  → the provider is holding the whole mailbox (hourly limits, 4xx
+ *                  throttling): nothing was sent, cool the mailbox down;
+ *  - 'rejected' → the RECIPIENT refused the mail (550-class): a definite bounce —
+ *                  mark it, suppress the address, count it;
+ *  - 'unknown'  → ambiguous (timeout mid-send): the outcome needs manual review.
+ */
+export const classifySendError = (err = {}) => {
+  const msg = String(err.message || err || '');
+  if (err.code === 'REAUTH_REQUIRED') return 'auth';
+  if (/\b5\.4\.6\b|hourly bounce limit|rate.?limit|too many|try again later|\b42[12]\b|\b45[0-2]\b|\b4\.7\./i.test(msg)) return 'account';
+  if (/53[045]\b[^\n]*auth|authentication failed|invalid login|login denied|credentials (rejected|invalid)|auth(entication)?\s*(failed|error)/i.test(msg)) return 'auth';
+  if (/\b55[0-3]\b|\b5\.1\.[1-6]\b|\b5\.5\.[12]\b|recipient rejected|address rejected|user unknown|user (does not exist|unknown)|does not exist|mailbox unavailable|no such recipient|over quota|mailbox full/i.test(msg)) return 'rejected';
+  return 'unknown';
+};
+
+/**
+ * Rolling one-hour bounce ledger per mailbox (mirrors the provider's hourly
+ * bounce limit). Returns the new window plus whether the auto-pause fired.
+ */
+export const bumpBounceWindow = (account, now = Date.now()) => {
+  const win = account?.bounceWindow || {};
+  const within = win.start && (now - Date.parse(win.start)) < 3600_000;
+  const start = within ? win.start : new Date(now).toISOString();
+  const count = (within ? win.count || 0 : 0) + 1;
+  return { start, count, limitHit: count >= BOUNCE_AUTO_LIMIT,
+    until: new Date(Date.parse(start) + 3600_000).toISOString() };
+};
+
 /** Normalise provider bounce/complaint payloads into one internal taxonomy. */
 export const classifyEvent = payload => {
   const raw = String([payload?.type, payload?.event, payload?.bounceType, payload?.bounceSubType, payload?.reason].filter(Boolean).join(' ')).toLowerCase();

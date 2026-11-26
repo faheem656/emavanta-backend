@@ -66,6 +66,7 @@ export async function recordAutomationTriggers({ organizationId, trigger, contac
     if (trigger === 'contact_added') return lists.size > 0 && (!sequence.listId || lists.has(String(sequence.listId)));
     if (trigger === 'tag_added') return tagSet.size > 0 && (!sequence.triggerTag || tagSet.has(String(sequence.triggerTag).trim().toLowerCase()));
     if (trigger === 'form_submitted') return !sequence.formId || String(sequence.formId) === String(formId);
+    if (trigger === 'email_opened' || trigger === 'email_clicked') return !sequence.listId || lists.has(String(sequence.listId));
     return true;
   });
   const events = matches.map(sequence => makeAutomationTriggerEvent({ organizationId, sequence, contactId, source,

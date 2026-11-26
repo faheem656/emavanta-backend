@@ -2,20 +2,20 @@ import { createContacts } from '../../../../packages/entitlements/contacts.js';
 import { collection, scoped } from '../../../../packages/database/store.js';
 import { registerWorker, getQueue } from '../../../../packages/queue/index.js';
 import { newId } from '../../../../packages/shared/utils.js';
-import { contactSchema } from '../../../../packages/validation/index.js';
+import { contactSchema, normalizeContactRow } from '../../../../packages/validation/index.js';
 import { createHmac } from 'node:crypto';
 import { classifyEvent } from '../../../../packages/deliverability/index.js';
 
 export const startOtherWorkers = () => {
-  registerWorker('import', async ({ organizationId, rows, listIds }) => {
+  registerWorker('import', async ({ organizationId, rows, listIds, consentIp }) => {
     const ctx = { organizationId };
     const valid=[];
     const requested=[...new Set([...(listIds||[]), ...rows.flatMap(row => Array.isArray(row.listIds) ? row.listIds : [])])];
     const available=new Set();
     for(const id of requested) if(await scoped('contact_lists',ctx).findOne({_id:id})) available.add(id);
     for (const row of rows) {
-      const parsed=contactSchema.safeParse({...row,listIds:[...new Set([...(row.listIds||[]),...(listIds||[])])].filter(id=>available.has(id))});
-      if(parsed.success)valid.push(parsed.data);
+      const parsed=contactSchema.safeParse({...normalizeContactRow(row),listIds:[...new Set([...(row.listIds||[]),...(listIds||[])])].filter(id=>available.has(id))});
+      if(parsed.success)valid.push({ ...parsed.data, consentSource: 'import', consentIp });
     }
     let created=0;
     for(let i=0;i<valid.length;i+=10000){const result=await createContacts(ctx,valid.slice(i,i+10000));created+=result.created.length;}

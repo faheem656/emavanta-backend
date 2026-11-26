@@ -13,7 +13,13 @@ export default async function analyticsRoutes(app) {
     return { campaigns: campaigns.length, contacts, lists,
       automations: automations.length, automationsActive: automations.filter(a => a.status === 'active').length,
       stats: campaigns.reduce((acc, c) => {
-      for (const k of ['sent','delivered','bounced','queued','replied','opened','clicked']) acc[k] = (acc[k] || 0) + (c.stats?.[k] || 0);
+      for (const k of ['sent','bounced','queued','replied','opened','clicked']) acc[k] = (acc[k] || 0) + (c.stats?.[k] || 0);
+      // SMTP mailboxes never report delivery receipts. When a campaign has zero
+      // explicit delivered events, estimate delivered = sent − bounced so the
+      // dashboard never shows a dead 0% funnel.
+      const explicit = Number(c.stats?.delivered || 0);
+      acc.delivered = (acc.delivered || 0)
+        + (explicit || Math.max(0, Number(c.stats?.sent || 0) - Number(c.stats?.bounced || 0)));
       return acc;
     }, {}), events: byType, note: 'opens are directional only (Apple Mail Privacy Protection)' };
   });
@@ -44,9 +50,18 @@ export default async function analyticsRoutes(app) {
       timeline[day] ||= Object.fromEntries(TRACKED.map(t => [t, 0]));
       if (timeline[day][e.type] !== undefined) timeline[day][e.type]++;
     }
+    // No delivery receipts anywhere (SMTP has none) → estimate sent − bounced,
+    // both in the funnel summary and in the daily chart series.
+    const deliveryEstimated = (summary.delivered || 0) === 0 && (summary.sent || 0) > 0;
+    if (deliveryEstimated) {
+      summary.delivered = Math.max(0, (summary.sent || 0) - (summary.bounced || 0));
+      for (const day of Object.values(timeline)) {
+        day.delivered = Math.max(0, (day.sent || 0) - (day.bounced || 0));
+      }
+    }
     const campaigns = (await scoped('campaigns', req.ctx).find({})).map(c => ({
       id: c._id, name: c.name, status: c.status, stream: c.stream, stats: c.stats || {}
     }));
-    return { summary, timeline, events, campaigns, total: all.length };
+    return { summary, timeline, events, campaigns, total: all.length, deliveryEstimated };
   });
 }

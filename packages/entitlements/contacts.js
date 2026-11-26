@@ -13,6 +13,11 @@ async function serial(key,work){
 }
 const limitError=(used,limit,requested)=>new AppError(402,'LIMIT_REACHED',`Contact limit reached (${used}/${limit}). Upgrade your plan or add contacts before importing more.`,{dimension:'contacts',used,limit,requested});
 
+// Constant-Contact-style consent: every NEW contact carries a subscription
+// status and an evidence record (who opted in, from where, under which text).
+const consentSourceFor = x => x.consentSource
+  || (String(x.source || '').startsWith('form:') ? 'website-form' : (x.source || 'manual'));
+
 export async function createContacts(ctx, inputs, {deferAutomation=false}={}){
  if(!ctx?.organizationId)throw new Error('Workspace required');
  if(!Array.isArray(inputs)||inputs.length>20000)throw new Error('Invalid contact batch');
@@ -25,7 +30,8 @@ export async function createContacts(ctx, inputs, {deferAutomation=false}={}){
   else unique.set(email,{...input,email,listIds:[...new Set(ids)],tags:[...new Set(tags)]});
  }
  const now=new Date().toISOString();
- const build=x=>({...x,_id:newId(),organizationId,dedupeKey:stableHash(organizationId,x.email),createdAt:now,updatedAt:now});
+ const build=x=>({...x,_id:newId(),organizationId,dedupeKey:stableHash(organizationId,x.email),createdAt:now,updatedAt:now,
+   status: x.status || 'subscribed', consentAt: x.consentAt || now, consentSource: consentSourceFor(x)});
  const apply=async({org,findExisting,count,insert,merge,findSequences,findEvents,insertEvents})=>{
   if(!org&&!ctx.demo)throw new Error('Workspace not found');
   const plan=org?.plan||(ctx.demo?'growth':'free'),limit=limitFor(plan,'contacts',effectiveAddons(org));
@@ -35,6 +41,15 @@ export async function createContacts(ctx, inputs, {deferAutomation=false}={}){
   const restored=[...unique.values()].filter(x=>existing.get(x.email)?.deleted===true);
   const used=await count(); if(limit>=0&&used+docs.length+restored.length>limit)throw limitError(used,limit,docs.length+restored.length);
   if(docs.length)await insert(docs);
+ // Auto-record consent evidence for every newly created contact (tamper-proof
+ // hash over org + email + source + text version — same as POST /consent).
+ if(docs.length)for(const doc of docs){
+   const version=String(doc.consentTextVersion||'v1');
+   await collection('consent_records').create({_id:newId(),organizationId,email:doc.email,
+     source:doc.consentSource,textVersion:version,ip:doc.consentIp||null,
+     userAgent:doc.consentUserAgent||null,
+     evidenceHash:stableHash(organizationId,doc.email,doc.consentSource,version),createdAt:now});
+ }
   let addedToLists=0;
   for(const x of unique.values()){
    const previous=existing.get(x.email);if(!previous)continue;

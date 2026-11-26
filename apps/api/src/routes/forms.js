@@ -253,10 +253,20 @@ export default async function formRoutes(app) {
     const requestedList = form.listId && await collection('contact_lists').findOne({ _id: form.listId, organizationId: form.organizationId }) ? [form.listId] : [];
     const profile = { firstName: data.first_name || data.firstName || existing?.firstName || '',
       lastName: data.last_name || data.lastName || existing?.lastName || '', company: data.company || existing?.company || '', phone: data.phone || existing?.phone || '' };
-    const contactCreation=await createContacts({ organizationId: form.organizationId, demo: process.env.DEMO_MODE === 'true' }, [{ email, ...profile, listIds: requestedList, source:`form:${form.slug}`, tags:form.tags || [] }],{deferAutomation:true});
+    const contactCreation=await createContacts({ organizationId: form.organizationId, demo: process.env.DEMO_MODE === 'true' },
+      [{ email, ...profile, listIds: requestedList, source:`form:${form.slug}`, tags:form.tags || [],
+ consentIp: req.ip, consentUserAgent: req.headers['user-agent'] || null }],{deferAutomation:true});
     const contact = await contacts.findOne({ organizationId: form.organizationId, email, deleted: { $ne: true } });
     const contactId = contact._id, listIds = new Set(contact.listIds || []);
-    await contacts.updateOne({ _id: contactId }, { $set: { ...profile, lastFormAt:now, lastFormId:form._id, source:`form:${form.slug}` } });
+    await contacts.updateOne({ _id: contactId }, { $set: { ...profile, lastFormAt:now, lastFormId:form._id, source:`form:${form.slug}`,
+      consentAt: now, consentSource: 'website-form' } });
+    // A returning submitter re-confirms consent: keep the evidence fresh too
+    // (new contacts already got their record inside createContacts).
+    if (existing) await collection('consent_records').create({ _id: newId(), organizationId: form.organizationId,
+      email, source: 'website-form', textVersion: String(form.consentTextVersion || 'v1'),
+      ip: req.ip || null, userAgent: req.headers['user-agent'] || null,
+      evidenceHash: stableHash(form.organizationId, email, 'website-form', String(form.consentTextVersion || 'v1')),
+      createdAt: now });
 
     const submission = {
       _id: newId(), organizationId: form.organizationId, formId: form._id, formSlug: form.slug,

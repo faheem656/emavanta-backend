@@ -1,7 +1,6 @@
 import { scoped } from '../../../../packages/database/store.js';
 import { newId, stableHash } from '../../../../packages/shared/utils.js';
 import { badRequest } from '../../../../packages/shared/errors.js';
-import { throughputFor } from '../../../../packages/deliverability/index.js';
 import { collection } from '../../../../packages/database/store.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -81,22 +80,6 @@ export default async function advanced3Routes(app) {
   });
 
   // Per-account send policy (cadence editor)
-  app.get('/send-policy/:accountId', async req => {
-    const acc = await scoped('sending_accounts', req.ctx).findOne({ _id: req.params.accountId });
-    const org = await collection('organizations').findOne({ _id: req.ctx.organizationId });
-    const plan = req.ctx.demo ? 'growth' : org?.plan || 'free';
-    const policy = acc?.sendPolicy || { minDelaySec:45, maxDelaySec:90, jitterPct:20, activeHours:{start:9,end:18}, dailyCap:50 };
-    // The plan ceiling is what actually caps the engine; the gaps below it are per mailbox.
-    return { ...policy, plan, throughput: throughputFor(plan), accountDailyCap: acc?.dailyCap || 50 };
-  });
-  app.put('/send-policy/:accountId', async req => {
-    const p = req.body;
-    if (Number(p.minDelaySec) > Number(p.maxDelaySec)) throw badRequest('min delay must be <= max delay');
-    await scoped('sending_accounts', req.ctx).updateOne({ _id: req.params.accountId }, { $set: { sendPolicy: p } });
-    const avg = (Number(p.minDelaySec) + Number(p.maxDelaySec)) / 2;
-    return { ok: true, policy: p, estimate: { perHour: Math.round(3600 / avg), perDay: Math.round((3600 / avg) * ((p.activeHours?.end || 18) - (p.activeHours?.start || 9))) } };
-  });
-
   // Mark all notifications read
   app.post('/notifications/read-all', async req => {
     await scoped('notifications', req.ctx).updateMany({ read: { $ne: true } }, { $set: { read: true } });

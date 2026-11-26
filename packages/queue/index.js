@@ -69,18 +69,36 @@ function mongoQueue(name) {
     async getWaiting() { await ensureIndexes(); return (await jobs().find({queue:name,state:'waiting'}).sort({availableAt:1}).limit(100).toArray()).map(mapJob); }
   };
 }
+// Delayed memory jobs live here until their timer fires: hasPendingJob must see
+// them, and a `replace` re-arm must cancel the old timer (mongo replace overwrites
+// the row; the memory driver has to mirror that or a pacer's successor stacks up).
+const memoryDelayed = new Map();
 function memoryQueue(name) {
   return {
     async add(jobName, data, opts = {}) {
       const id=opts.jobId||stableHash(name,jobName,JSON.stringify(data));
-      const existing=memQueue(name).find(j=>j.id===id&&j.attempts<(j.opts.attempts||4));
-      if(existing){if(!opts.replace&&opts.dedupe!==false)return existing; const at=memQueue(name).indexOf(existing);if(at>=0)memQueue(name).splice(at,1);}
+      const key=`${name}:${id}`;
+      const existing=memQueue(name).find(j=>j.id===id&&j.attempts<(j.opts.attempts||4))
+        || (memoryDelayed.get(key)?.job || null);
+      if(existing){
+        if(!opts.replace&&opts.dedupe!==false)return existing;
+        const at=memQueue(name).indexOf(existing);if(at>=0)memQueue(name).splice(at,1);
+        const pending=memoryDelayed.get(key);if(pending){clearTimeout(pending.timer);memoryDelayed.delete(key);}
+      }
       const job={id,name:jobName,data,opts,attempts:0};
-      const enqueue=()=>{memQueue(name).push(job);const worker=memoryWorkers.get(name);if(worker)setTimeout(()=>worker.process(job),0);};
-      if(opts.delay>0)setTimeout(enqueue,opts.delay);else enqueue();return job;
+      const enqueue=()=>{memoryDelayed.delete(key);memQueue(name).push(job);const worker=memoryWorkers.get(name);if(worker)setTimeout(()=>worker.process(job),0);};
+      if(opts.delay>0){const timer=setTimeout(enqueue,opts.delay);memoryDelayed.set(key,{timer,job});}
+      else enqueue();
+      return job;
     },
-    async getJobCounts(){return {waiting:memQueue(name).length,active:0,failed:0,completed:0};},
-    async getWaiting(){return memQueue(name);}
+    async getJobCounts(){
+      const delayed=[...memoryDelayed.keys()].filter(k=>k.startsWith(`${name}:`)).length;
+      return {waiting:memQueue(name).length+delayed,active:0,failed:0,completed:0};
+    },
+    async getWaiting(){
+      return [...memQueue(name),
+        ...[...memoryDelayed.entries()].filter(([k])=>k.startsWith(`${name}:`)).map(([,v])=>v.job)];
+    }
   };
 }
 export const getQueue = name => {
@@ -151,5 +169,27 @@ export const registerWorker = (name, processor) => {
   return {close:async()=>memoryWorkers.delete(name)};
 };
 export const publishOutbox = async event => {await getQueue(event.queue||'outbox').add(event.type,event.payload,{jobId:stableHash('outbox',event._id||event.id)});return true;};
+
+/**
+ * True when a job with this id is waiting (delayed or due) or active. Used by the
+ * scheduler sweep to revive a dead pacer without resetting a healthy one's delay —
+ * re-arming a delayed pacer on every sweep would collapse the human gap to the
+ * sweep interval.
+ */
+export const hasPendingJob = async (name, jobId) => {
+  if (!QUEUE_NAMES.includes(name)) return false;
+  if (isMemoryMode()) {
+    const id = String(jobId);
+    return memQueue(name).some(j => j.id === id) || memoryDelayed.has(`${name}:${id}`);
+  }
+  try {
+    await ensureIndexes();
+    const row = await jobs().findOne({ _id: idFor(name, String(jobId)), state: { $in: ['waiting', 'active'] } });
+    return !!row;
+  } catch (e) {
+    queueUnavailable(e);
+    return true; // cannot prove the job is dead — do not risk a duplicate pacer
+  }
+};
 export const queueReadiness = async () => {const info=dbInfo();return {driver:info.driver==='mongo'?'mongo':'memory',ready:info.driver==='mongo'&&info.connected,durable:info.driver==='mongo'&&info.connected};};
 export const closeQueues = async () => {await Promise.allSettled([...workers].map(w=>w.close()));queues.clear();indexes=null;outageUntil=0;outageFailures=0;outageLastLog=0;outageProbe=false;};

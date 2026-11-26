@@ -1,4 +1,4 @@
-﻿import { z } from 'zod';
+import { z } from 'zod';
 export const email = z.string().email().max(254).transform(v => v.toLowerCase().trim());
 export const password = z.string().min(12).max(128);
 export const registerSchema = z.object({ email, password, name: z.string().min(2).max(80), organization: z.string().min(2).max(80) });
@@ -14,6 +14,46 @@ export const contactSchema = z.object({
   tags: z.array(z.string().trim().min(1).max(80)).max(50).optional(),
   listIds: z.array(z.string()).default([])
 });
+
+// Keys that are real schema fields — everything else (string/number) becomes a
+// personalization custom field, exactly like the CSV importer does in the UI.
+const NO_CUSTOM = new Set(['email', 'firstName', 'lastName', 'company', 'customFields',
+  'phone', 'city', 'country', 'title', 'tags', 'listIds', 'first_name', 'last_name',
+  'firstname', 'lastname', 'surname', 'organization', 'organisation', 'company_name',
+  'job_title', 'phone_number', 'custom_fields', 'source', 'status',
+  'consentSource', 'consentIp', 'consentUserAgent', 'consentTextVersion']);
+
+/**
+ * Raw CSV/API rows arrive as `first_name`, `Job Title`, `organization`… — map
+ * them the way the UI importer does so `{{first_name|…}}` and custom
+ * `{{column}}` tokens actually resolve at send time.
+ */
+export const normalizeContactRow = row => {
+  if (!row || typeof row !== 'object') return row;
+  const r = { ...row };
+  const pick = (...keys) => {
+    for (const k of keys) {
+      const v = r[k];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+      if (typeof v === 'number') return String(v);
+    }
+    return '';
+  };
+  if (!r.firstName) { const v = pick('first_name', 'firstname', 'FirstName', 'first'); if (v) r.firstName = v; }
+  if (!r.lastName) { const v = pick('last_name', 'lastname', 'LastName', 'surname'); if (v) r.lastName = v; }
+  if (!r.company) { const v = pick('organization', 'organisation', 'company_name', 'CompanyName'); if (v) r.company = v; }
+  const custom = { ...(r.customFields && typeof r.customFields === 'object' ? r.customFields : {}) };
+  for (const [k, v] of Object.entries(r)) {
+    if (NO_CUSTOM.has(k) || k.startsWith('_') || k.length > 40) continue;
+    if (typeof v !== 'string' && typeof v !== 'number') continue;
+    const s = String(v).trim();
+    if (!s) continue;
+    const key = k.replace(/[^a-zA-Z0-9_.]/g, '_').toLowerCase();
+    if (!(key in custom)) custom[key] = s;
+  }
+  r.customFields = custom;
+  return r;
+};
 export const sendPolicySchema = z.object({
   minDelaySec: z.number().int().min(5).max(600).default(45),
   maxDelaySec: z.number().int().min(10).max(900).default(90),
@@ -29,7 +69,7 @@ export const sendPolicySchema = z.object({
   }, { message: 'timezone must be a valid IANA timezone' }),
   schedule: z.object({
     startTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'startTime must use HH:mm'),
-    endTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'endTime must use HH:mm'),
+    endTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$|^24:00$/, 'endTime must use HH:mm'),
     daysOfWeek: z.array(z.number().int().min(1).max(7)).min(1)
       .refine(days => new Set(days).size === days.length, {
         message: 'daysOfWeek must not contain duplicates'
@@ -42,23 +82,70 @@ export const sendPolicySchema = z.object({
     };
     return toMinutes(schedule.startTime) < toMinutes(schedule.endTime);
   }, { message: 'schedule endTime must be later than startTime' }),
-  dailyCap: z.number().int().min(1).max(2000).default(50),
-  weeklyCap: z.number().int().min(1).max(14000).default(250),
+  // Caps go up to blast's defaults (5,000/day, 35,000/week) — human's small
+  // numbers stay the default, but blast must pass validation too.
+  dailyCap: z.number().int().min(1).max(10000).default(50),
+  weeklyCap: z.number().int().min(1).max(100000).default(250),
   weekend: z.boolean().default(false),
   pauseOnReply: z.boolean().default(true),
   warmup: z.boolean().default(false)
 }).refine(v => v.maxDelaySec >= v.minDelaySec, { message: 'maxDelaySec must be >= minDelaySec' });
+/**
+ * Live pacing edits for a campaign that may already be sending: the daily cap,
+ * pause between emails and the schedule/timezone can all change mid-flight and
+ * take effect on the pacer's very next tick.
+ */
+export const campaignPacingSchema = z.object({
+  // Mode can be flipped while the campaign is queued/paused/running: blast drains
+  // the remaining list immediately, human re-arms the one-at-a-time pacer.
+  sendMode: z.enum(['human', 'blast']).optional(),
+  gapSeconds: z.number().int().min(5).max(3600).optional(),
+  minDelaySec: z.number().int().min(5).max(600).optional(),
+  maxDelaySec: z.number().int().min(10).max(900).optional(),
+  jitterPct: z.number().min(0).max(40).optional(),
+  dailyCap: z.number().int().min(1).max(10000).optional(),
+  weeklyCap: z.number().int().min(1).max(100000).optional(),
+  timezone: z.string().optional().refine(value => {
+    if (value === undefined) return true;
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: value });
+      return true;
+    } catch {
+      return false;
+    }
+  }, { message: 'timezone must be a valid IANA timezone' }),
+  schedule: z.object({
+    startTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'startTime must use HH:mm'),
+    endTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$|^24:00$/, 'endTime must use HH:mm'),
+    daysOfWeek: z.array(z.number().int().min(1).max(7)).min(1)
+      .refine(days => new Set(days).size === days.length, {
+        message: 'daysOfWeek must not contain duplicates'
+      })
+  }).optional().refine(schedule => {
+    if (!schedule) return true;
+    const toMinutes = value => {
+      const [hours, minutes] = value.split(':').map(Number);
+      return hours * 60 + minutes;
+    };
+    return toMinutes(schedule.startTime) < toMinutes(schedule.endTime);
+  }, { message: 'schedule endTime must be later than startTime' }),
+  activeHours: z.object({ start: z.number().int().min(0).max(23), end: z.number().int().min(1).max(24) }).optional(),
+  weekend: z.boolean().optional(),
+  pauseOnReply: z.boolean().optional()
+}).refine(v => v.maxDelaySec === undefined || v.minDelaySec === undefined || v.maxDelaySec >= v.minDelaySec,
+  { message: 'maxDelaySec must be >= minDelaySec' });
 export const sequenceSchema = z.object({ name: z.string().min(2).max(120),
   description: z.string().max(280).optional(),
-  trigger: z.enum(['manual','contact_added','form_submitted','tag_added','api']).optional(),
+  trigger: z.enum(['manual','contact_added','form_submitted','tag_added','api','email_opened','email_clicked']).optional(),
   listId: z.string().max(120).optional(), triggerTag: z.string().trim().min(1).max(80).optional(),
   accountId: z.string().max(120).optional(),
   status: z.enum(['draft','paused','active']).optional(),
   formId: z.string().max(80).optional(),
   steps: z.array(z.object({
-    type: z.enum(['email','delay','condition']), templateId: z.string().max(120).optional(), accountId: z.string().max(120).optional(),
+    type: z.enum(['email','delay','condition','tag']), templateId: z.string().max(120).optional(), accountId: z.string().max(120).optional(),
     delayMinutes: z.number().int().min(0).max(525600).optional(), condition: z.string().trim().max(120).optional(),
-    subject: z.string().max(200).optional()
+    subject: z.string().max(200).optional(),
+    tags: z.array(z.string().trim().min(1).max(40)).max(10).optional()
   })).min(1).max(30) });
 export const templateSchema = z.object({
   name: z.string().min(2).max(120), subject: z.string().min(1).max(200),

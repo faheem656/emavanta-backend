@@ -1,4 +1,5 @@
 import { createContacts } from '../../../../packages/entitlements/contacts.js';
+import { normalizeContactRow } from '../../../../packages/validation/index.js';
 /**
  * Advanced platform layer: deliverability tools, outbox visibility, scheduler,
  * refresh sessions, streaming CSV imports, personalization registry,
@@ -227,8 +228,11 @@ export default async function advanced4Routes(app) {
     const batch = await scoped('import_batches', req.ctx).findOne({ _id: req.params.id });
     if (!batch || batch.status !== 'staged') throw badRequest('Batch is not staged');
     for (const id of batch.listIds || []) if (!await scoped('contact_lists', req.ctx).findOne({_id:id})) throw badRequest('A destination list no longer exists. Stage the import again.');
-    const rows=batch.rows.map(row=>({ email:String(row.email).toLowerCase().trim(), firstName:row.first_name||row.firstName,
-      lastName:row.last_name||row.lastName, company:row.company, customFields:row.custom_fields?{note:row.custom_fields}:{}, listIds:batch.listIds||[] }));
+    const rows=batch.rows.map(row=>normalizeContactRow({ ...row,
+      email:String(row.email).toLowerCase().trim(), firstName:row.first_name||row.firstName,
+      lastName:row.last_name||row.lastName, company:row.company,
+      customFields:row.custom_fields?{note:row.custom_fields}:{},
+      listIds:batch.listIds||[], consentSource: 'import', consentIp: req.ip }));
     const result=await createContacts(req.ctx,rows);
     const created=result.created.length,duplicates=result.duplicates,addedToLists=result.addedToLists;
     await scoped('import_batches', req.ctx).updateOne({ _id: batch._id }, { $set: { status: 'committed', created, duplicates, committedAt: new Date().toISOString() } });
@@ -259,7 +263,7 @@ export default async function advanced4Routes(app) {
   app.post('/personalization/preview', async req => {
     const { subject = '', html = '', sample = {} } = req.body || {};
     const tokens = extractTokens(subject) .concat(extractTokens(html));
-    const rendered = { subject: renderText(subject, sample), html: renderText(html, sample) };
+    const rendered = { subject: renderText(subject, sample, { html: false }), html: renderText(html, sample) };
     const check = preflight({ subject, html, tokens: sample, unsubscribeUrl: 'https://track.emavanta.com/u/preview' });
     return { tokens: [...new Set(tokens)], rendered, check };
   });

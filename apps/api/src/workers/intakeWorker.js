@@ -38,5 +38,10 @@ export const startIntakeWorker = () => registerWorker('campaign_intake', async p
     await getQueue('campaign_intake').add('campaign.intake',
       { ...payload, offset: next, after: result.nextAfter || null },
       { jobId: `intake-${campaignId}-${result.nextAfter || next}` });
+  } else {
+    // Audience fully copied: if every batch already finished (e.g. the last
+    // chunk added no new rows), nobody else would flip the campaign — do it now.
+    const { completeFinishedCampaigns } = await import('./campaignRunner.js');
+    await completeFinishedCampaigns({ campaignId }).catch(() => {});
   }
 });

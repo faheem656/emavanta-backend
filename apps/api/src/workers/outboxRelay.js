@@ -4,10 +4,11 @@ import { markPublished } from '../../../../packages/database/outbox.js';
 
 /**
  * Which campaigns must be sent by the human-cadence pacer rather than a bulk batch.
- * Exported so the rule is testable — it used to live inline and silently blasted
- * marketing campaigns that the user had marked human-paced.
+ * Exported so the rule is testable. Everything paces unless the user explicitly
+ * chose blast — that choice wins on every stream (outreach included), while
+ * legacy payloads without a mode keep the safe human default.
  */
-export const shouldPace = payload => payload?.stream === 'outreach' || payload?.sendMode === 'human';
+export const shouldPace = payload => payload?.sendMode !== 'blast';
 
 /**
  * Reliable outbox relay: DB event -> persistent queue with deterministic jobId.

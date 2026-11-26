@@ -10,6 +10,12 @@ import { badRequest, notFound } from '../../../../packages/shared/errors.js';
 export default async function templateRoutes(app) {
   app.get('/templates', async req => scoped('templates', req.ctx).find({}));
 
+  app.get('/templates/:id', async req => {
+    const t = await scoped('templates', req.ctx).findOne({ _id: req.params.id });
+    if (!t) throw notFound('Template not found');
+    return t;
+  });
+
   app.post('/templates', async req => {
     assertPermission(req.ctx, PERMISSIONS.TEMPLATES_WRITE);
     const input = templateSchema.parse(req.body);
@@ -78,7 +84,7 @@ export default async function templateRoutes(app) {
     if (!t) throw notFound('Template not found');
     const html = t.mode === 'code' ? t.html : blocksToHtml(t.blocks, t.styles);
     const { renderText } = await import('../../../../packages/email-engine/personalization.js');
-    return { subject: renderText(t.subject, req.body.sample || {}), html: renderText(html, req.body.sample || {}) };
+    return { subject: renderText(t.subject, req.body.sample || {}, { html: false }), html: renderText(html, req.body.sample || {}) };
   });
 
   app.post('/templates/parse-html', async req => ({ blocks: htmlToBlocks(req.body.html) }));

@@ -77,8 +77,10 @@ async function finishTrigger(payload) {
   if (!claim.matchedCount) return;
   try {
     const contact=await scoped('contacts',ctx).findOne({ _id:event.contactId,deleted:{$ne:true} });
-    if (!contact || !contact.email || contact.status==='unsubscribed') {
-      await events.updateOne({ _id:triggerEventId,organizationId }, { $set:{status:'skipped',skipReason:'contact_unavailable',leaseUntil:null,updatedAt:nowIso()} }); return;
+    if (!contact || !contact.email || contact.status==='unsubscribed' || contact.status==='bounced') {
+      await events.updateOne({ _id:triggerEventId,organizationId }, { $set:{status:'skipped',
+        skipReason: contact?.status==='bounced' ? 'contact_bounced' : 'contact_unavailable',
+        leaseUntil:null,updatedAt:nowIso()} }); return;
     }
     const suppression=await scoped('suppressions',ctx).findOne({ email:String(contact.email).toLowerCase(),status:{$ne:'expired'} });
     if (suppression) {
@@ -269,6 +271,23 @@ async function processStep(payload) {
     await updateRun(ctx,runId,{status:'queued'},{status:'completed',completedAt:nowIso(),conditionResult:result.continue?'continued':'stopped',reason:result.reason});
     if(!result.continue){await scoped('sequence_enrollments',ctx).updateOne({_id:enrollmentId},{$set:{status:'stopped',
       stopReason:result.reason||'condition_false',completedAt:nowIso(),currentStep:stepIndex+1}});return;}
+    return advance(ctx,flow,enrollment,stepIndex+1,nowIso());
+  }
+  if(step.type==='tag'){
+    const tags=(Array.isArray(step.tags)?step.tags:[]).map(t=>String(t).trim()).filter(Boolean);
+    if(!tags.length){await markNeedsReview(ctx,enrollment,'invalid_tag_step',runId,'blocked');return;}
+    const current=Array.isArray(contact.tags)?contact.tags:[];
+    const added=tags.filter(t=>!current.includes(t));
+    const merged=[...current,...added];
+    await scoped('contacts',ctx).updateOne({_id:contact._id},{$set:{tags:merged,updatedAt:nowIso()}});
+    // Chained workflows: adding a tag can itself start another automation.
+    if(added.length){try{
+      const { recordAutomationTriggers, publishAutomationTriggerEvents } = await import('../../../../packages/automations/triggers.js');
+      const res=await recordAutomationTriggers({organizationId:ctx.organizationId,trigger:'tag_added',
+        contactId:contact._id,tags:added,source:'automation_tag_step'});
+      if(res?.eventIds?.length)await publishAutomationTriggerEvents(res.eventIds);
+    }catch{ /* sweep republishes pending trigger rows */ }}
+    await updateRun(ctx,runId,{status:'queued'},{status:'completed',completedAt:nowIso(),nextStepIndex:stepIndex+1,nextRunAt:nowIso()});
     return advance(ctx,flow,enrollment,stepIndex+1,nowIso());
   }
   if(step.type!=='email'){await markNeedsReview(ctx,enrollment,'unsupported_step',runId,'blocked');return;}

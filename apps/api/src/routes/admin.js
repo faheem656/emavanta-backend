@@ -23,6 +23,14 @@ export default async function adminRoutes(app) {
     return rows.map(({_id,name,email,company,topic,message,deliveryStatus,createdAt,sentAt})=>({id:_id,name,email,company,topic,message,deliveryStatus:deliveryStatus||'unknown',createdAt,sentAt}));
   });
 
+  // Per-message delete — the Support tab can clear messages one by one.
+  app.delete('/admin/contact-messages/:id',async req=>{
+    await assertAdmin(req.ctx);
+    const result=await collection('contact_messages').deleteOne({_id:req.params.id});
+    if(!result.deletedCount)throw notFound('Contact message not found');
+    return {ok:true,message:'Contact message deleted.'};
+  });
+
   app.post('/admin/contact-messages/:id/retry',async req=>{
     await assertAdmin(req.ctx);if(isMemoryMode())throw forbidden('Persistent storage is required.');
     const db=nativeDatabase(), id=req.params.id;
