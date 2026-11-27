@@ -29,11 +29,30 @@ export const selectedSenderPool = async (ctx, campaign) => {
   const accounts = await scoped('sending_accounts', ctx).find({ _id: { $in: uniqueIds } });
   if (accounts.length !== uniqueIds.length) throw badRequest('One or more selected mailboxes is unavailable in this workspace.');
   const now = Date.now();
-  const invalid = accounts.some(account => account.status !== 'active'
-    || (account.authMethod === 'mock' && process.env.NODE_ENV !== 'test')
-    || (account.tokenExpiresAt && (!Number.isFinite(Date.parse(account.tokenExpiresAt)) || Date.parse(account.tokenExpiresAt) <= now))
-    || !canAccessWorkspace(ctx, account.workspaceId));
-  if (invalid) throw badRequest('Every selected mailbox must be active, verified, and accessible. Reconnect or remove any mailbox that needs attention.');
+  // Report EVERY offending mailbox with its exact reason — the old one-line
+  // error gave no clue which mailbox (often an invisible pool member that had
+  // cooled down or failed a test) was blocking the save.
+  const problems = [];
+  for (const account of accounts) {
+    const label = account.fromEmail || account._id;
+    if (!canAccessWorkspace(ctx, account.workspaceId)) { problems.push(`${label}: not available in this workspace`); continue; }
+    if (account.authMethod === 'mock' && process.env.NODE_ENV !== 'test') { problems.push(`${label}: demo mailbox`); continue; }
+    if (account.tokenExpiresAt && (!Number.isFinite(Date.parse(account.tokenExpiresAt)) || Date.parse(account.tokenExpiresAt) <= now)) {
+      problems.push(`${label}: sign-in expired — reconnect it on Mail accounts`); continue;
+    }
+    // `limited` is the auto bounce-cooldown with a scheduled resume; the send
+    // path skips it until then, so it must not block pool changes or launch.
+    if (account.status === 'limited') continue;
+    if (account.status !== 'active') {
+      const why = account.status === 'pending_verification' ? 'pending verification — run a connection test'
+        : account.status === 'reauth_required' || account.status === 'revoked' ? 'needs reconnecting (sign-in expired or revoked)'
+        : account.status === 'error' ? `failed — ${String(account.lastError || 'check it on Mail accounts').slice(0, 140)}`
+        : account.status === 'paused' ? 'paused'
+        : account.status;
+      problems.push(`${label}: ${why}`);
+    }
+  }
+  if (problems.length) throw badRequest(`Every selected mailbox must be active, verified, and accessible. Fix these first — ${problems.join('; ')}.`);
   if (accounts.some(account => account.stream && account.stream !== campaign.stream))
     throw badRequest(`Every selected mailbox must support the ${campaign.stream} stream. Update the pool or mailbox stream.`);
   return accounts;

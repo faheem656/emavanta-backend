@@ -1,6 +1,7 @@
 import './apps/api/src/env.js'; // must stay first: loads .env before anything reads process.env
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import compress from '@fastify/compress';
 import { config } from './apps/api/src/config.js';
 import { contextPlugin } from './apps/api/src/plugins/context.js';
 import { errorPlugin } from './apps/api/src/plugins/errors.js';
@@ -22,6 +23,9 @@ const app = Fastify({
   requestIdHeader: 'x-request-id'
 });
 await app.register(cors, { delegator: corsDelegator(allowedFrontendOrigins()) });
+// Gzip/brotli every JSON payload over 1 KB — list/analytics responses were
+// shipped uncompressed, which is the main "site feels slow" cost on mobile.
+await app.register(compress, { global: true, threshold: 1024 });
 
 // Browsers/proxies sometimes send `content-type: application/json` with an empty body
 // (e.g. a bodyless DELETE). Treat that as {} instead of a 400 so the action still works.

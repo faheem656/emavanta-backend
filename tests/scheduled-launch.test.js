@@ -135,3 +135,28 @@ test('completeFinishedCampaigns flips finished blasts to completed, leaves open 
   await completeFinishedCampaigns({campaignId:stillQueued.campaignId});
   assert.equal(await statusOf(stillQueued),'queued');
 });
+
+// ─────────────────────────────────────────────────────────────
+// Sender pool validation must name every offending mailbox and must NOT
+// block on `limited` (auto bounce-cooldown with a scheduled resume).
+// ─────────────────────────────────────────────────────────────
+test('selectedSenderPool reports each bad mailbox by name and allows cooling-down ones',async()=>{
+  const { selectedSenderPool } = await import('../apps/api/src/services/campaignLaunch.js');
+  const orgId=`org-senderpool-${Date.now()}`;
+  const ctx={organizationId:orgId,user:{id:'u1',role:'owner'}};
+  await scoped('sending_accounts',ctx).create({_id:'acc-ok',fromEmail:'ok@x.test',status:'active',stream:'outreach'});
+  await scoped('sending_accounts',ctx).create({_id:'acc-err',fromEmail:'bad@x.test',status:'error',lastError:'Auth failed',stream:'outreach'});
+  await scoped('sending_accounts',ctx).create({_id:'acc-lim',fromEmail:'cool@x.test',status:'limited',limitedUntil:new Date(Date.now()+3600e3).toISOString(),stream:'outreach'});
+  await scoped('sending_accounts',ctx).create({_id:'acc-pend',fromEmail:'new@x.test',status:'pending_verification',stream:'outreach'});
+
+  await assert.rejects(()=>selectedSenderPool(ctx,{accountPool:['acc-ok','acc-err','acc-pend'],stream:'outreach'}),e=>{
+    assert.match(e.message,/bad@x\.test: failed — Auth failed/);
+    assert.match(e.message,/new@x\.test: pending verification/);
+    assert.ok(!/ok@x\.test/.test(e.message),'healthy mailbox must not be named');
+    return true;
+  });
+
+  // limited (auto cooldown) + active → allowed
+  const ok=await selectedSenderPool(ctx,{accountPool:['acc-ok','acc-lim'],stream:'outreach'});
+  assert.equal(ok.length,2);
+});
