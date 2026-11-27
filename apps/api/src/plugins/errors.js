@@ -11,6 +11,16 @@ const zodIssues = err => {
 
 let lastMongoLog=0;
 export const errorPlugin = fp(async app => {
+  // A handler that accidentally returns nothing used to produce "200 OK" with a
+  // zero-byte body — the dashboard then rendered empty lists. Never emit an
+  // empty 2xx: serialize it as {} so clients always receive parseable JSON.
+  app.addHook('onSend', (req, reply, payload, done) => {
+    if ((payload === undefined || payload === '') && reply.statusCode >= 200 && reply.statusCode < 300) {
+      reply.header('content-type', 'application/json; charset=utf-8');
+      return done(null, '{}');
+    }
+    done(null, payload);
+  });
   app.setErrorHandler((err, req, reply) => {
     if (isMongoUnavailable(err)) {
       noteMongoFailure(err);const now=Date.now();if(now-lastMongoLog>30000){lastMongoLog=now;console.error('[db] Request failed: database unavailable. Driver will retry connections; check database/network access.');}
