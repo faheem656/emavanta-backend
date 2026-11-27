@@ -337,13 +337,13 @@ const INDEXES = {
   campaign_recipients: [[{ organizationId: 1, campaignId: 1, status: 1 }], [{ campaignId: 1, contactId: 1 }], [{ organizationId: 1, campaignId: 1, status: 1, sendingStartedAt: 1 }]],
   campaign_batches: [[{ campaignId: 1, status: 1, index: 1 }]],
   campaign_chunks: [[{ organizationId: 1, campaignId: 1, offset: 1 }]],
-  delivery_events: [[{ organizationId: 1, campaignId: 1, type: 1 }], [{ dedupeKey: 1 }]],
+  delivery_events: [[{ organizationId: 1, campaignId: 1, type: 1 }], [{ dedupeKey: 1 }], [{ organizationId: 1, campaignId: 1, type: 1, createdAt: 1 }], [{ organizationId: 1, campaignId: 1, sendingAccountId: 1, type: 1 }]],
   outbox_events: [[{ status: 1, createdAt: 1 }]],
   automation_trigger_events: [[{ organizationId: 1, status: 1, createdAt: 1 }], [{ organizationId: 1, sequenceId: 1, status: 1 }]],
   sequence_enrollments: [[{ organizationId: 1, sequenceId: 1, status: 1 }], [{ organizationId: 1, contactId: 1, sequenceId: 1 }]],
   sequence_step_runs: [[{ organizationId: 1, enrollmentId: 1, stepIndex: 1 }]],
   sessions: [[{ organizationId: 1, status: 1 }], [{ 'token.jti': 1 }]],
-  sending_accounts: [[{ organizationId: 1, status: 1 }]],
+  sending_accounts: [[{ organizationId: 1, status: 1 }], [{ status: 1, 'tracking.status': 1, 'tracking.method': 1 }]],
   usage_counters: [[{ organizationId: 1, cycle: 1 }]]
 };
 

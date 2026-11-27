@@ -7,6 +7,7 @@ import { publishAutomationTriggerEvents } from '../../../../packages/automations
 import { enqueueAutomationStep } from '../../../../packages/automations/jobs.js';
 import { fanoutBlastBatches, completeFinishedCampaigns } from './campaignRunner.js';
 import { launchDueCampaigns } from '../services/campaignLaunch.js';
+import { pollTrackingChannels } from './trackingPoller.js';
 import { pacingFor } from '../../../../packages/email-engine/cadence.js';
 import { cooldownUntil } from '../../../../packages/deliverability/index.js';
 
@@ -105,6 +106,8 @@ export async function sweepScheduledJobs() {
   // Safety net: finish any campaign whose batches and intake are done (blast
   // has no pacer, so without this a finished blast could stay "queued").
   await completeFinishedCampaigns().catch(e=>console.error('[scheduler] completion sweep failed',String(e?.message||e)));
+  // Event tracking: poll IMAP/POP3/Mail-API channels for fresh bounces (≤5 min apart).
+  await pollTrackingChannels().catch(e=>console.error('[scheduler] tracking poll failed',String(e?.message||e)));
   if(!isMemoryMode()){
     const due=await collection('crypto_addon_grants').find({status:'active',expiresAt:{$lte:new Date().toISOString()}},{limit:200});
     for(const id of new Set(due.map(x=>x.organizationId).filter(Boolean)))await expireCryptoAddons(id);

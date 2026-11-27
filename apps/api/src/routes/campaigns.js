@@ -174,17 +174,25 @@ export default async function campaignRoutes(app) {
   app.get('/campaigns/:id/tracking', async req => {
     const campaign = await scoped('campaigns', req.ctx).findOne({ _id: req.params.id });
     if (!campaign) throw notFound('Campaign not found');
-    const events = await scoped('delivery_events', req.ctx).find({ campaignId: campaign._id },
-      { sort: { createdAt: -1 }, limit: 500 });
-    const recipients = await scoped('campaign_recipients', req.ctx).find({ campaignId: campaign._id }, { limit: 1000 });
-    const accounts = await scoped('sending_accounts', req.ctx).find({});
-    const [unknown,stalled]=await Promise.all([
-      scoped('campaign_recipients',req.ctx).find({campaignId:campaign._id,status:'delivery_unknown'},{limit:25}),
-      scoped('campaign_recipients',req.ctx).find({campaignId:campaign._id,status:'sending',sendingStartedAt:{$lt:new Date(Date.now()-300000).toISOString()}},{limit:25})
-    ]);
-    const reviewNeeded=[...unknown,...stalled].map(r=>({id:r._id,email:r.email,status:r.status}));
     const types = ['queued','sent','delivered','opened','clicked','replied','bounced','complained','deferred','unsubscribed','test_sent','test_delivered'];
-    const summary = Object.fromEntries(types.map(t => [t, events.filter(e => e.type === t).length]));
+    // Counts cover the WHOLE campaign (indexed countDocuments). The old code
+    // counted a 500-event sample, which silently undercounted busy campaigns.
+    const summary = {};
+    for (const t of types) summary[t] = await scoped('delivery_events', req.ctx).countDocuments({ campaignId: campaign._id, type: t });
+    // Paged event stream: one page at a time — a campaign with millions of
+    // events never ships (or renders) everything in a single response.
+    const eventLimit = Math.min(500, Math.max(20, Number(req.query?.eventLimit) || 100));
+    const eventSkip = Math.max(0, Number(req.query?.eventSkip) || 0);
+    const [events, eventsTotal, accounts, recipientTotal, queuedNow, unknown, stalled] = await Promise.all([
+      scoped('delivery_events', req.ctx).find({ campaignId: campaign._id }, { sort: { createdAt: -1 }, limit: eventLimit, skip: eventSkip }),
+      scoped('delivery_events', req.ctx).countDocuments({ campaignId: campaign._id }),
+      scoped('sending_accounts', req.ctx).find({}),
+      scoped('campaign_recipients', req.ctx).countDocuments({ campaignId: campaign._id }),
+      scoped('campaign_recipients', req.ctx).countDocuments({ campaignId: campaign._id, status: 'queued' }),
+      scoped('campaign_recipients', req.ctx).find({ campaignId: campaign._id, status: 'delivery_unknown' }, { limit: 25 }),
+      scoped('campaign_recipients', req.ctx).find({ campaignId: campaign._id, status: 'sending', sendingStartedAt: { $lt: new Date(Date.now() - 300000).toISOString() } }, { limit: 25 })
+    ]);
+    const reviewNeeded = [...unknown, ...stalled].map(r => ({ id: r._id, email: r.email, status: r.status }));
     const n = (a, b) => b ? Math.round((a / b) * 1000) / 10 : 0;
     const sent = (summary.sent || 0) + (summary.test_sent || 0) || campaign.stats?.sent || 0;
     const explicitDelivered = (summary.delivered || 0) + (summary.test_delivered || 0);
@@ -196,41 +204,67 @@ export default async function campaignRoutes(app) {
     const deliveryEstimated = !explicitDelivered && !statsDelivered && sent > 0;
     const delivered = explicitDelivered || statsDelivered
       || (sent > 0 ? Math.max(0, sent - (summary.bounced || 0)) : 0);
+    // The queued EVENT never disappears after a send, so the card shows the
+    // recipients still waiting right now instead of the all-time count.
+    summary.queued = queuedNow;
+    if (deliveryEstimated) summary.delivered = delivered; // the card reads summary, not the percentages
     const percentages = {
       delivery: n(delivered, sent),
       open: n(summary.opened, delivered),
-      click: n(summary.clicked, summary.opened),
+      // Clicks can exceed opens (link scanners, blocked pixels) — the old
+      // clicks/opens denominator produced impossible values like "200% of opens".
+      click: n(summary.clicked, delivered),
       reply: n(summary.replied, sent),
       bounce: n(summary.bounced, sent),
       complaint: n(summary.complained, sent),
       unsubscribe: n(summary.unsubscribed, sent),
-      progress: n(sent, sent + summary.queued)
+      // Progress = recipients processed / total. queued EVENTS never go away,
+      // so sent/(sent+queuedEvents) froze around 50% forever.
+      progress: recipientTotal ? n(recipientTotal - queuedNow, recipientTotal) : 0
     };
+    // Last 7 days of sends for the chart — one indexed count per day.
     const timeline = {};
-    for (const e of events) {
-      const day = String(e.createdAt || '').slice(0, 10) || 'unknown';
-      timeline[day] ||= Object.fromEntries(types.map(t => [t, 0]));
-      if (timeline[day][e.type] !== undefined) timeline[day][e.type]++;
+    const dayMs = 86400000;
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    for (let i = 6; i >= 0; i--) {
+      const start = new Date(todayStart.getTime() - i * dayMs);
+      const end = new Date(start.getTime() + dayMs);
+      timeline[start.toISOString().slice(0, 10)] = { sent: await scoped('delivery_events', req.ctx).countDocuments({
+        campaignId: campaign._id, type: 'sent',
+        createdAt: { $gte: start.toISOString(), $lt: end.toISOString() } }) };
     }
-    if (deliveryEstimated) {
-      summary.delivered = delivered; // the card reads summary, not the percentages
-      for (const day of Object.values(timeline)) {
-        day.delivered = Math.max(0, (day.sent || 0) - (day.bounced || 0));
-      }
-    }
+    // Per-mailbox breakdown via indexed counts (the old one read the same
+    // 500-event sample and missed mailboxes on busy campaigns).
+    const accountIds = Array.isArray(campaign.accountPool) && campaign.accountPool.length
+      ? campaign.accountPool : accounts.map(a => a._id);
     const byAccount = {};
-    for (const e of events) {
-      if (!e.sendingAccountId) continue;
-      byAccount[e.sendingAccountId] ||= { sent: 0, delivered: 0, opened: 0, clicked: 0, bounced: 0 };
-      if (byAccount[e.sendingAccountId][e.type] !== undefined) byAccount[e.sendingAccountId][e.type]++;
-    }
-    if (deliveryEstimated) {
-      // Same sent − bounced estimate per mailbox when the provider reports nothing.
-      for (const row of Object.values(byAccount)) row.delivered = Math.max(0, (row.sent || 0) - (row.bounced || 0));
-    }
-    const problems = events.filter(e => ['bounced','complained','unsubscribed','deferred'].includes(e.type)).slice(0, 100);
-    // Why isn't it sending? A parked batch reason + the health of this campaign's
-    // mailbox pool, so the page can say it plainly instead of "just queued".
+    await Promise.all(accounts.filter(a => accountIds.includes(a._id)).map(async acc => {
+      const row = { sent: 0, delivered: 0, opened: 0, clicked: 0, bounced: 0 };
+      await Promise.all(Object.keys(row).map(async t => {
+        row[t] = await scoped('delivery_events', req.ctx)
+          .countDocuments({ campaignId: campaign._id, sendingAccountId: acc._id, type: t });
+      }));
+      if (deliveryEstimated) row.delivered = Math.max(0, (row.sent || 0) - (row.bounced || 0));
+      byAccount[acc.fromEmail || acc._id] = row;
+    }));
+    const problems = await scoped('delivery_events', req.ctx).find(
+      { campaignId: campaign._id, type: { $in: ['bounced', 'complained', 'unsubscribed', 'deferred'] } },
+      { sort: { createdAt: -1 }, limit: 100 });
+    // How it ACTUALLY sent: first/last send and the achieved gap — feeds the
+    // read-only "Sending pace" card (pace is viewed here, never edited).
+    const [firstSentRows, lastSentRows] = await Promise.all([
+      scoped('delivery_events', req.ctx).find({ campaignId: campaign._id, type: 'sent' }, { sort: { createdAt: 1 }, limit: 1 }),
+      scoped('delivery_events', req.ctx).find({ campaignId: campaign._id, type: 'sent' }, { sort: { createdAt: -1 }, limit: 1 })
+    ]);
+    const firstAt = firstSentRows[0]?.createdAt || null;
+    const lastAt = lastSentRows[0]?.createdAt || null;
+    const spanMs = firstAt && lastAt ? Math.max(0, Date.parse(lastAt) - Date.parse(firstAt)) : 0;
+    const paceActual = {
+      firstAt, lastAt, sent,
+      avgGapSec: sent > 1 && spanMs > 0 ? Math.max(1, Math.round(spanMs / 1000 / (sent - 1))) : null,
+      perHour: sent > 1 && spanMs >= 60000 ? Math.round(sent / (spanMs / 3600000)) : null
+    };
     const openBatch = await scoped('campaign_batches', req.ctx)
       .findOne({ campaignId: campaign._id, status: { $ne: 'done' } });
     const poolIds = Array.isArray(campaign.accountPool) ? campaign.accountPool : [];
@@ -240,11 +274,8 @@ export default async function campaignRoutes(app) {
         lastError: a.lastError || null, limitedUntil: a.limitedUntil || null }));
     const blocked = openBatch?.blockedReason
       ? { reason: openBatch.blockedReason, at: openBatch.blockedAt || null } : null;
-    return { campaign, summary, percentages, timeline, events, reviewNeeded, recipients: recipients.length,
-      deliveryEstimated, blocked, mailboxIssues,
-      byAccount: Object.fromEntries(await Promise.all(Object.entries(byAccount).map(async ([id, v]) => [
-        accounts.find(a => a._id === id)?.fromEmail || id, v
-      ]))), problems };
+    return { campaign, summary, percentages, timeline, events, eventsTotal, reviewNeeded,
+      recipients: recipientTotal, deliveryEstimated, blocked, mailboxIssues, byAccount, problems, paceActual };
   });
 
   /** Send a real tracked test through a connected account (mock in demo mode). */
@@ -338,8 +369,13 @@ export default async function campaignRoutes(app) {
 
   app.post('/campaigns/:id/pause', async req => {
     assertPermission(req.ctx, PERMISSIONS.CAMPAIGNS_WRITE);
+    // Only a RUNNING campaign can be paused — completed/draft/scheduled ones
+    // must never flip back to a state that could send again.
+    const res = await scoped('campaigns', req.ctx).updateOne(
+      { _id: req.params.id, status: 'queued' },
+      { $set: { status: 'paused', 'intake.status': 'cancelled' } });
+    if (!res.matchedCount) throw badRequest('Only a running campaign can be paused.');
     // Intake stops too: a paused campaign must not keep copying recipients in the background.
-    await scoped('campaigns', req.ctx).updateOne({ _id: req.params.id }, { $set: { status: 'paused', 'intake.status': 'cancelled' } });
     await scoped('campaign_recipients', req.ctx).updateMany({ campaignId: req.params.id, status: 'queued' }, { $set: { status: 'paused' } });
     return { ok: true };
   });

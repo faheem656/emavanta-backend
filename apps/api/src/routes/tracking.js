@@ -34,6 +34,12 @@ const record = async (d, type, extra = {}) => {
         ? await collection('contacts').findOne({ organizationId: d.org, email, deleted: { $ne: true } })
         : null;
       if (contact?._id) {
+        // The contact row itself remembers the latest open (visible everywhere
+        // a contact is inspected — including people who later unsubscribed).
+        if (type === 'opened') {
+          await collection('contacts').updateOne({ _id: contact._id, organizationId: d.org },
+            { $set: { lastOpenedAt: new Date().toISOString() } });
+        }
         const { recordAutomationTriggers, publishAutomationTriggerEvents } =
           await import('../../../../packages/automations/triggers.js');
         const res = await recordAutomationTriggers({ organizationId: d.org,
@@ -75,6 +81,10 @@ export default async function trackingRoutes(app) {
     if (!d) return reply.code(400).send('Invalid token');
     const scope = req.body?.choice === 'all' || req.query?.choice === 'all' ? 'all' : 'campaign';
     await record(d, 'unsubscribed', { scope });
+    // An unsubscribe link only exists INSIDE the email — clicking it proves the
+    // message was opened. Count it as an open too (deduped per message, so a
+    // real pixel open is never double-counted) and mark the contact.
+    await record(d, 'opened', { userAgent: req.headers['user-agent'], impliedBy: 'unsubscribe' });
     await scoped('suppressions', { organizationId: d.org }).create({ _id: newId(), email: d.email,
       reason: scope === 'all' ? 'unsubscribe_all' : 'unsubscribe', campaignId: d.campaignId,
       createdAt: new Date().toISOString() });
@@ -95,6 +105,8 @@ export default async function trackingRoutes(app) {
     const d = decode(req.params.token, 'u');
     if (!d) return reply.code(400).send('Invalid token');
     await record(d, 'unsubscribed', { scope: 'all' });
+    // Same rule as the form: following the unsubscribe link = the email was opened.
+    await record(d, 'opened', { userAgent: req.headers['user-agent'], impliedBy: 'unsubscribe' });
     await scoped('suppressions', { organizationId: d.org }).create({ _id: newId(), email: d.email,
       reason: 'unsubscribe_all', createdAt: new Date().toISOString() });
     await scoped('contacts', { organizationId: d.org }).updateOne(

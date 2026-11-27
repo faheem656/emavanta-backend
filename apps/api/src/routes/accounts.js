@@ -8,14 +8,28 @@ import { acquireStream } from '../../../../packages/rate-limiter/index.js';
 import { cooldownUntil, classifySendError } from '../../../../packages/deliverability/index.js';
 import { config } from '../config.js';
 import { audit } from '../plugins/audit.js';
+import { TRACKING_METHODS, TRACKING_LABEL, testTrackingChannel, generateWebhookSecret, signPayload, buildTrackingDoc } from '../services/trackingChannels.js';
 
 const oauthStates = new Map();
+const HOSTINGER_API_BASE = 'https://api.mail.hostinger.com';
 
 export default async function accountRoutes(app) {
   app.get('/accounts', async req => {
     const all = await scoped('sending_accounts', req.ctx).find({});
     return all.filter(a => canAccessWorkspace(req.ctx, a.workspaceId))
-      .map(a => ({ ...a, encryptedCredentials: '[ENCRYPTED]', credentials: undefined }));
+      .map(a => {
+        const t = a.tracking && a.tracking.method ? {
+          method: a.tracking.method, status: a.tracking.status || null,
+          verifiedAt: a.tracking.verifiedAt || null, lastTestAt: a.tracking.lastTestAt || null,
+          lastPolledAt: a.tracking.lastPolledAt || null, lastError: a.tracking.lastError || null,
+          detail: a.tracking.detail || null,
+          ...(a.tracking.method === 'webhook' || a.tracking.method === 'hostinger'
+            ? { webhookPath: a.tracking.webhookPath || null, secret: a.tracking.secret || null }
+            : {})
+        } : null;
+        const { encryptedCredentials, credentials, tracking, ...rest } = a;
+        return { ...rest, tracking: t, encryptedCredentials: '[ENCRYPTED]', credentials: undefined };
+      });
   });
 
   app.post('/accounts/oauth/start', async req => {
@@ -88,16 +102,126 @@ export default async function accountRoutes(app) {
         catch (e) { throw badRequest(`Mail server rejected the credentials: ${e.message}`); }
       }
     }
+    // Event tracking is MANDATORY: every mailbox reports bounces/complaints
+    // through at least one channel, and the channel is tested LIVE here —
+    // if the test fails, the account is NOT added.
+    const trackingMethod = String(req.body?.tracking?.method || '').toLowerCase();
+    if (!TRACKING_METHODS.includes(trackingMethod)) {
+      throw badRequest('Choose how this mailbox reports bounces — Webhook, IMAP, POP3, Mail API or Hostinger (at least one). It is tested before the mailbox is added.');
+    }
+    const accountId = newId();
+    const trackingCfg = { ...(req.body?.tracking || {}) };
+    delete trackingCfg.method;
+    trackingCfg.accountId = accountId;          // Hostinger provisions the webhook against THIS id
+    trackingCfg.fromEmail = fromEmail;
+    if (trackingMethod === 'webhook' && !trackingCfg.secret) trackingCfg.secret = generateWebhookSecret();
+    const trackingTest = await testTrackingChannel(trackingMethod, trackingCfg);
+    if (trackingMethod === 'hostinger') {
+      // Keep the provisioning results (webhook id + mailbox resource) in the
+      // encrypted config so re-test / reconfigure can manage the webhook later.
+      Object.assign(trackingCfg, { webhookId: trackingTest.webhookId,
+        mailboxResourceId: trackingTest.mailboxResourceId, mailboxAddress: trackingTest.mailboxAddress });
+    }
     const status = method === 'mock' ? 'active' : (method === 'esp_api' || c.skipTest === true ? 'pending_verification' : 'active');
-    const account = await scoped('sending_accounts', req.ctx).create({ _id: newId(), authMethod: method, status,
+    const account = await scoped('sending_accounts', req.ctx).create({ _id: accountId, authMethod: method, status,
       stream: req.body.stream || 'outreach', fromEmail, fromName: req.body.fromName || '',
       smtpHost: method === 'smtp' ? c.host : undefined,
       shared: !!req.body.shared, workspaceId: req.body.workspaceId || null, dailyCap: req.body.dailyCap || 50,
       warmup: !!req.body.warmup, sentToday: 0, connectedAt: new Date().toISOString(),
+      tracking: buildTrackingDoc(trackingMethod, trackingCfg, accountId, trackingTest,
+        { encryptedConfig: trackingMethod === 'webhook' ? undefined : encryptCredentials(trackingCfg) }),
       encryptedCredentials: encryptCredentials({ ...c, skipTest: undefined }) });
-    await audit(req.ctx, 'account.connect', 'sending_account', { method, verified: status === 'active' });
+    await audit(req.ctx, 'account.connect', 'sending_account', { method, verified: status === 'active', tracking: trackingMethod });
     return { ...account, encryptedCredentials: '[ENCRYPTED]', verified: status === 'active',
-      next: status === 'active' ? 'Send a test email to confirm delivery.' : 'Run a connection test to activate this mailbox.' };
+      tracking: { method: trackingMethod, status: 'verified', webhookPath: account.tracking.webhookPath || null, secret: account.tracking.secret || null },
+      next: status === 'active'
+        ? `Mailbox connected · ${TRACKING_LABEL[trackingMethod]} tracking verified. Send a test email to confirm delivery.`
+        : `Mailbox saved · ${TRACKING_LABEL[trackingMethod]} tracking verified. Run a connection test to activate sending.` };
+  });
+
+  // Live re-test of the stored channel — "Test tracking" on the accounts page.
+  // Webhook does a REAL signed ping through the public inbound endpoint.
+  app.post('/accounts/:id/tracking/test', async req => {
+    assertPermission(req.ctx, PERMISSIONS.ACCOUNTS_CONNECT);
+    const acc = await scoped('sending_accounts', req.ctx).findOne({ _id: req.params.id });
+    if (!acc || !canAccessWorkspace(req.ctx, acc.workspaceId)) throw notFound('Account not found');
+    const t = acc.tracking || {};
+    if (!t.method) throw badRequest('No event tracking configured for this mailbox.');
+    const now = new Date().toISOString();
+    if (t.method === 'webhook') {
+      const sample = JSON.stringify({ test: true, event: 'tracking_test', email: acc.fromEmail, accountId: acc._id, ts: Date.now() });
+      const sig = signPayload(sample, t.secret || '');
+      const base = process.env.API_PUBLIC_BASE || `http://127.0.0.1:${config.port}`;
+      let res;
+      try {
+        res = await fetch(`${base}/api/v1/webhooks/mailbox/${acc._id}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-webhook-signature': sig },
+          body: sample, signal: AbortSignal.timeout(8000)
+        });
+      } catch (e) { throw badRequest(`Webhook endpoint unreachable — ${e.message}`); }
+      if (!res.ok) throw badRequest(`Webhook endpoint rejected the signed test event (HTTP ${res.status}).`);
+      await scoped('sending_accounts', req.ctx).updateOne({ _id: acc._id },
+        { $set: { 'tracking.lastTestAt': now, 'tracking.lastError': null, 'tracking.detail': 'Live ping accepted — endpoint reachable and signature verified.' } });
+      return { ok: true, message: 'Live webhook test accepted — the endpoint is reachable and the signature verified.' };
+    }
+    const cfg = decryptCredentials(t.config || '');
+    // Hostinger's re-test is a REAL delivery through the public internet:
+    // Hostinger POSTs to our webhook URL and reports the upstream status.
+    const r = await testTrackingChannel(t.method, t.method === 'hostinger'
+      ? { ...cfg, mode: 'verify', accountId: acc._id, fromEmail: acc.fromEmail }
+      : cfg);
+    await scoped('sending_accounts', req.ctx).updateOne({ _id: acc._id },
+      { $set: { 'tracking.lastTestAt': now, 'tracking.lastError': null, 'tracking.detail': r.detail } });
+    return { ok: true, message: r.detail };
+  });
+
+  // Reconfigure the channel — same test-first rule: nothing saves unless it passes.
+  app.post('/accounts/:id/tracking', async req => {
+    assertPermission(req.ctx, PERMISSIONS.ACCOUNTS_CONNECT);
+    const acc = await scoped('sending_accounts', req.ctx).findOne({ _id: req.params.id });
+    if (!acc || !canAccessWorkspace(req.ctx, acc.workspaceId)) throw notFound('Account not found');
+    const method = String(req.body?.tracking?.method || '').toLowerCase();
+    if (!TRACKING_METHODS.includes(method)) throw badRequest('Unknown tracking channel.');
+    const cfg = { ...(req.body?.tracking || {}) };
+    delete cfg.method;
+    cfg.accountId = acc._id;
+    cfg.fromEmail = acc.fromEmail;
+    if (method === 'webhook' && !cfg.secret) cfg.secret = generateWebhookSecret();
+    if (method === 'hostinger') {
+      // Replace (not duplicate) the previously provisioned webhook on reconfigure.
+      try {
+        const old = decryptCredentials(acc.tracking?.config || '');
+        if (old?.webhookId) { cfg.webhookId = old.webhookId; cfg.mailboxResourceId = old.mailboxResourceId; }
+      } catch { /* fresh provision */ }
+    } else if (acc.tracking?.method === 'hostinger') {
+      // Switching AWAY from Hostinger: remove the webhook we provisioned so it
+      // stops POSTing at us (best effort — the token may already be revoked).
+      try {
+        const old = decryptCredentials(acc.tracking.config || '');
+        if (old?.webhookId && old?.token) {
+          await fetch(`${HOSTINGER_API_BASE}/api/v1/mailboxes/${encodeURIComponent(old.mailboxResourceId)}/webhooks/${encodeURIComponent(old.webhookId)}`,
+            { method: 'DELETE', headers: { authorization: `Bearer ${old.token}` }, signal: AbortSignal.timeout(8000) }).catch(() => {});
+        }
+      } catch { /* nothing to clean */ }
+    }
+    const r = await testTrackingChannel(method, cfg);
+    if (method === 'hostinger') {
+      Object.assign(cfg, { webhookId: r.webhookId, mailboxResourceId: r.mailboxResourceId, mailboxAddress: r.mailboxAddress });
+    }
+    const now = new Date().toISOString();
+    const set = {
+      'tracking.method': method, 'tracking.status': 'verified', 'tracking.verifiedAt': now,
+      'tracking.lastTestAt': now, 'tracking.lastError': null, 'tracking.detail': r.detail,
+      'tracking.lastPolledAt': null
+    };
+    const unset = {};
+    if (method === 'webhook') { set['tracking.secret'] = cfg.secret; set['tracking.webhookPath'] = `/api/v1/webhooks/mailbox/${acc._id}`; unset['tracking.config'] = ''; }
+    else if (method === 'hostinger') { set['tracking.secret'] = r.secret; set['tracking.webhookPath'] = `/api/v1/webhooks/mailbox/${acc._id}`; set['tracking.config'] = encryptCredentials(cfg); }
+    else { set['tracking.config'] = encryptCredentials(cfg); unset['tracking.secret'] = ''; unset['tracking.webhookPath'] = ''; }
+    await scoped('sending_accounts', req.ctx).updateOne({ _id: acc._id }, { $set: set, ...(Object.keys(unset).length ? { $unset: unset } : {}) });
+    await audit(req.ctx, 'account.tracking_update', 'sending_account', { method });
+    return { ok: true, message: `${TRACKING_LABEL[method]} tracking verified and saved.`, detail: r.detail };
   });
 
   app.post('/accounts/:id/test', async req => {

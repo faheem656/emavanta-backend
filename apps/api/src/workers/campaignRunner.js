@@ -217,7 +217,9 @@ const runBatch = async payload => {
   const tokenFallbacks = await tokenFallbacksFor(ctx);
   if (!campaign || !template || !batch) return;
   if (batch.status === 'done') return;
-  if (['paused', 'draft'].includes(campaign.status)) return; // Resume re-fans this batch out via the sweep.
+  // A completed campaign must NEVER send again — even if the queue redelivers
+  // this job after the completion flip (at-least-once delivery).
+  if (['paused', 'draft', 'completed'].includes(campaign.status)) return; // Resume re-fans this batch out via the sweep.
   const blast = (payload.sendMode || campaign.sendMode) === 'blast';
   if (!blast) {
     // The campaign was switched back to human while this batch job was queued:
