@@ -95,6 +95,26 @@ test('per-account inbound webhook: signature gates the queue, test events ping o
   assert.equal(JSON.parse(ok.body).accepted, 1);
   assert.equal(await hasPendingJob('webhook', jobId), true);
 
+  // Bearer auth style (Hostinger hMail manual webhooks send NO signature header):
+  // same secret as Authorization: Bearer must also be accepted…
+  const bearerId = `wh-bearer-${Date.now()}`;
+  const bearerBody = { event: 'bounce', email: 'bearer@company.test', id: bearerId };
+  const bearer = await app.inject({
+    method: 'POST', url: `/webhooks/mailbox/${accountId}`,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` },
+    payload: JSON.stringify(bearerBody)
+  });
+  assert.equal(bearer.statusCode, 200);
+  assert.equal(JSON.parse(bearer.body).accepted, 1);
+  assert.equal(await hasPendingJob('webhook', bearerId), true);
+  // …and a WRONG bearer must still be rejected.
+  const badBearer = await app.inject({
+    method: 'POST', url: `/webhooks/mailbox/${accountId}`,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${'z'.repeat(32)}` },
+    payload: JSON.stringify(bearerBody)
+  });
+  assert.equal(badBearer.statusCode, 400);
+
   // Unknown mailbox → rejected (different URL, valid signature for its body).
   const orphanBody = { event: 'bounce', email: 'a@b.test' };
   const missing = await app.inject({

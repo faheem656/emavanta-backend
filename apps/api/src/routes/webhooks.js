@@ -56,8 +56,13 @@ export default async function webhookRoutes(app) {
       throw badRequest('Tracking webhook not configured for this mailbox.');
     }
     const raw = JSON.stringify(req.body);
-    if (!verifyWebhookSignature(raw, req.headers['x-webhook-signature'], acc.tracking.secret)) {
-      throw badRequest('Bad signature');
+    // TWO auth styles, ONE secret: the standard HMAC signature header AND
+    // `Authorization: Bearer <secret>` — Hostinger hMail's manual webhooks (and
+    // many ESPs) only send the Bearer form, which used to die here as
+    // "Bad signature" → provider showed Fail on every delivery.
+    const bearerOk = bearerMatches(req.headers.authorization, acc.tracking.secret);
+    if (!bearerOk && !verifyWebhookSignature(raw, req.headers['x-webhook-signature'], acc.tracking.secret)) {
+      throw badRequest('Bad signature — send x-webhook-signature (HMAC-SHA256 hex) or Authorization: Bearer <signing secret>.');
     }
     if (isReplay(req.headers['x-webhook-id'])) return { ok: true, duplicate: true };
     const events = Array.isArray(req.body) ? req.body : [req.body];
