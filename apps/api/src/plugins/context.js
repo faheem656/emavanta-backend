@@ -81,7 +81,11 @@ export const contextPlugin = fp(async app => {
     const publicPaths = new Set(['/health', '/health/scale', '/ready', '/billing/plans', '/contact',
       '/auth/register', '/auth/login', '/auth/login/mfa', '/auth/verify-otp', '/auth/verify-otp/resend',
       '/auth/password/forgot', '/auth/password/reset/check', '/auth/password/reset', '/accounts/oauth/callback']);
-    if (publicPaths.has(path) || /^\/public\/forms\//.test(path) || /^\/webhooks\//.test(path) || /^\/(u|t)\//.test(path)) return;
+    // Webhooks are PUBLIC by design — they authenticate themselves (HMAC
+    // signature / Bearer secret) inside the route. The match must cover the
+    // BASE path `/webhooks` too: providers get a401 "Sign in to continue" from
+    // THIS guard when someone pastes `…/api/v1/webhooks` without the mailbox id.
+    if (publicPaths.has(path) || /^\/public\/forms\//.test(path) || /^\/webhooks(\/|$)/.test(path) || /^\/(u|t)\//.test(path)) return;
     throw unauthorized('Sign in to continue.');
   });
 });

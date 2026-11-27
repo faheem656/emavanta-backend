@@ -16,6 +16,17 @@ const bearerMatches = (header, secret) => {
 
 export default async function webhookRoutes(app) {
   /**
+   * The BASE webhook URL (`/api/v1/webhooks`, no mailbox id) is the classic
+   * paste mistake — providers test it and used to get the session guard's
+   * 401 "Sign in to continue". Answer with exact guidance instead.
+   */
+  const needMailboxPath = async () => {
+    throw badRequest('This URL cannot receive events. Use POST /api/v1/webhooks/mailbox/:accountId — copy the exact Webhook URL from the mailbox row (Webhook URL button). Provider-wide events: POST /api/v1/webhooks/provider/:provider.');
+  };
+  app.get('/webhooks', needMailboxPath);
+  app.post('/webhooks', needMailboxPath);
+
+  /**
    * Per-mailbox inbound webhook: the provider POSTs signed events here
    * (/api/v1/webhooks/mailbox/:accountId). Two auth schemes, one endpoint:
    *   webhook   — HMAC-SHA256 hex in `x-webhook-signature` (generic providers)

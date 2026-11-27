@@ -4,6 +4,7 @@ import Fastify from 'fastify';
 import { testTrackingChannel, signPayload, TRACKING_METHODS } from '../apps/api/src/services/trackingChannels.js';
 import { looksLikeBounce, extractBouncedEmails } from '../apps/api/src/workers/trackingPoller.js';
 import { errorPlugin } from '../apps/api/src/plugins/errors.js';
+import { contextPlugin } from '../apps/api/src/plugins/context.js';
 import webhookRoutes from '../apps/api/src/routes/webhooks.js';
 import trackingRoutes from '../apps/api/src/routes/tracking.js';
 import { signLink } from '../packages/security/links.js';
@@ -134,6 +135,36 @@ test('hostinger receiver: Bearer secret gates delivery and wakes the inbound pol
   assert.equal(JSON.parse(ok.body).received, true);
   const acc = await scoped('sending_accounts', { organizationId: orgId }).findOne({ _id: accountId });
   assert.equal(acc.tracking.lastPolledAt, null);
+  await app.close();
+  await closeQueues();
+});
+
+test('webhook URLs are public — the session guard never401s them', async () => {
+  const app = Fastify();
+  await app.register(errorPlugin);
+  await app.register(contextPlugin);
+  await app.register(webhookRoutes, { prefix: '/api/v1' });
+
+  // BASE url (the classic paste mistake): clear guidance, never "Sign in to continue".
+  const base = await app.inject({
+    method: 'POST', url: '/api/v1/webhooks',
+    headers: { 'content-type': 'application/json' }, payload: '{}'
+  });
+  assert.notEqual(base.statusCode, 401);
+  assert.equal(base.statusCode, 400);
+  const baseBody = JSON.parse(base.body);
+  assert.match(baseBody.error.message, /webhooks\/mailbox/);
+  assert.notEqual(baseBody.error.message, 'Sign in to continue.');
+
+  // Mailbox path reaches OUR handler (unknown account → our400, not the guard's401).
+  const mb = await app.inject({
+    method: 'POST', url: `/api/v1/webhooks/mailbox/acc-nope-${Date.now()}`,
+    headers: { 'content-type': 'application/json' }, payload: JSON.stringify({ event: 'x' })
+  });
+  assert.notEqual(mb.statusCode, 401);
+  assert.equal(mb.statusCode, 400);
+  assert.match(JSON.parse(mb.body).error.message, /not configured/);
+
   await app.close();
   await closeQueues();
 });
