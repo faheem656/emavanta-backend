@@ -1,4 +1,4 @@
-import { scoped } from '../../../../packages/database/store.js';
+import { scoped, collection } from '../../../../packages/database/store.js';
 import { assertPermission, PERMISSIONS } from '../../../../packages/security/rbac.js';
 import { contactSchema, normalizeContactRow } from '../../../../packages/validation/index.js';
 import { newId, stableHash } from '../../../../packages/shared/utils.js';
@@ -6,6 +6,8 @@ import { badRequest, notFound } from '../../../../packages/shared/errors.js';
 import { getQueue } from '../../../../packages/queue/index.js';
 import { createContacts } from '../../../../packages/entitlements/contacts.js';
 import { recordAutomationTriggers } from '../../../../packages/automations/triggers.js';
+import { PLANS } from '../../../../packages/entitlements/definitions.js';
+import { isFresh, normalizeEmail } from '../../../../packages/email-verification/index.js';
 
 const listName = value => {
   const name = String(value || '').trim();
@@ -26,6 +28,12 @@ export default async function contactRoutes(app) {
     if (req.query.listId) filter.listIds = String(req.query.listId);
     if (req.query.search) { const q = String(req.query.search).slice(0,100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const rx = new RegExp(q,'i'); filter.$or = [{email:rx},{company:rx},{firstName:rx},{lastName:rx}]; }
+    // Verification filter (contacts page): a status, or UNVERIFIED = never checked.
+    if (req.query.verification) {
+      const v = String(req.query.verification);
+      if (v === 'UNVERIFIED') (filter.$and ||= []).push({ $or: [{ verification: { $exists: false } }, { verification: null }] });
+      else if (['PENDING','VALID','INVALID','CATCH_ALL','RISKY','UNKNOWN','ERROR'].includes(v)) filter['verification.status'] = v;
+    }
     const total = await scoped('contacts', req.ctx).countDocuments(filter);
     const items = await scoped('contacts', req.ctx).find(filter, {limit,skip,sort:{createdAt:-1}});
     return { items, total, skip, limit };
@@ -181,5 +189,91 @@ export default async function contactRoutes(app) {
     await scoped('contact_lists', req.ctx).deleteOne({ _id: req.params.id });
     await scoped('contacts', req.ctx).updateMany({ listIds: req.params.id }, { $pull: { listIds: req.params.id } });
     return { ok: true };
+  });
+
+  /* ── Email verification (DB-first shared knowledge base) ── */
+
+  /** Counts by verification status + credit balances (dashboard panel). */
+  app.get('/contacts/verification-stats', async req => {
+    const statuses = ['PENDING', 'VALID', 'INVALID', 'RISKY', 'CATCH_ALL', 'UNKNOWN', 'ERROR'];
+    const counts = {};
+    let covered = 0;
+    for (const s of statuses) {
+      counts[s] = await scoped('contacts', req.ctx).countDocuments({ deleted: { $ne: true }, 'verification.status': s });
+      covered += counts[s];
+    }
+    const total = await scoped('contacts', req.ctx).countDocuments({ deleted: { $ne: true } });
+    counts.UNVERIFIED = Math.max(0, total - covered);
+    const org = (await collection('organizations').findOne({ _id: req.ctx.organizationId })) || {};
+    const allowance = Number(PLANS[org.plan || 'free']?.limits?.verification_credits ?? 0);
+    const usedDoc = await collection('usage_counters').findOne({ _id: `${req.ctx.organizationId}:${org.cycle || 'monthly'}` });
+    const cycleUsed = Number(usedDoc?.verification_credits || 0);
+    const packBalance = Number(org.verifyCredits || 0);
+    let kbSize = 0;
+    try { kbSize = await collection('email_verifications').countDocuments({}); } catch { /* optional stat */ }
+    return {
+      counts, total, kbSize, plan: org.plan || 'free',
+      credits: {
+        planAllowance: allowance, cycleUsed,
+        planRemaining: allowance === -1 ? -1 : Math.max(0, allowance - cycleUsed),
+        packBalance,
+        remaining: (allowance === -1 ? -1 : Math.max(0, allowance - cycleUsed)) + packBalance
+      }
+    };
+  });
+
+  /**
+   * Manual / bulk verify: marks contacts PENDING (the gate holds them) and
+   * enqueues DB-first verification. Fresh verdicts are skipped for free —
+   * force=true re-checks them (charged, per the locked credit rules).
+   */
+  app.post('/contacts/verify', async req => {
+    assertPermission(req.ctx, PERMISSIONS.CONTACTS_WRITE);
+    const { contactIds, listIds, force = false, limit = 5000, unverifiedOnly = false } = req.body || {};
+    const filter = { deleted: { $ne: true } };
+    if (Array.isArray(contactIds) && contactIds.length) {
+      if (contactIds.length > 5000) throw badRequest('Verify up to 5,000 contacts per run.');
+      filter._id = { $in: contactIds };
+    } else if (Array.isArray(listIds) && listIds.length) {
+      filter.listIds = { $in: listIds };
+    } else if (unverifiedOnly) {
+      // "Verify everything not checked yet" — scoped by the same5,000/run cap.
+    } else {
+      throw badRequest('Choose contacts, lists, or enable “unverified only”.');
+    }
+    // Never-checked only: skip contacts that already carry a record (fresh
+    // ones are skipped inside the loop anyway — this just narrows the scan).
+    if (unverifiedOnly && !(Array.isArray(contactIds) && contactIds.length)) {
+      (filter.$and ||= []).push({ $or: [{ verification: { $exists: false } }, { verification: null }] });
+    }
+    // Friendly pre-flight: if there is no credit anywhere (Free plan has ZERO
+    // included credits and no pack balance), say so BEFORE queueing — the
+    // worker would otherwise hold every contact in PENDING quota_exceeded.
+    {
+      const org = (await collection('organizations').findOne({ _id: req.ctx.organizationId })) || {};
+      const allowance = Number(PLANS[org.plan || 'free']?.limits?.verification_credits ?? 0);
+      const usedDoc = await collection('usage_counters').findOne({ _id: `${req.ctx.organizationId}:${org.cycle || 'monthly'}` });
+      const cycleUsed = Number(usedDoc?.verification_credits || 0);
+      const packBalance = Number(org.verifyCredits || 0);
+      const remaining = allowance === -1 ? -1 : Math.max(0, allowance - cycleUsed) + packBalance;
+      if (remaining === 0) {
+        throw badRequest('No verification credits left — Free plan includes none. Buy a credit pack in Billing → Verification credit packs.');
+      }
+    }
+    const rows = await scoped('contacts', req.ctx).find(filter, { limit: Math.min(5000, Number(limit) || 5000) });
+    const nowIso = new Date().toISOString();
+    const { enqueueVerification } = await import('../workers/emailVerificationWorker.js');
+    let queued = 0, skippedFresh = 0;
+    for (const c of rows) {
+      const em = normalizeEmail(c.email);
+      if (!em) continue;
+      if (!force && c.verification && isFresh(c.verification)) { skippedFresh += 1; continue; }
+      await scoped('contacts', req.ctx).updateOne({ _id: c._id },
+        { $set: { verification: { status: 'PENDING', reason: 'manual', queuedAt: nowIso, version: 1 } } });
+      await enqueueVerification({ organizationId: req.ctx.organizationId, email: em, contactId: c._id, source: 'manual', nonce: String(Date.now()) });
+      queued += 1;
+    }
+    return { ok: true, queued, skippedFresh, total: rows.length,
+      note: `${queued} queued for verification${skippedFresh ? ` · ${skippedFresh} already fresh (free)` : ''}.` };
   });
 }

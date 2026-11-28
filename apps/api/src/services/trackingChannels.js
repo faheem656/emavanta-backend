@@ -14,7 +14,10 @@ import { verifyWebhookSignature } from '../../../../packages/providers/webhooks.
  *   pop3    — same, over POP3
  *   mailapi — we poll the ESP's REST API for bounce lists
  */
-export const TRACKING_METHODS = ['webhook', 'imap', 'pop3', 'mailapi', 'hostinger'];
+/** Channels offered on NEW mailboxes. Legacy methods keep working for accounts
+ *  that already have them (receiver + re-test stay intact) but are hidden. */
+export const TRACKING_METHODS = ['imap', 'pop3', 'mailapi'];
+export const LEGACY_TRACKING_METHODS = ['webhook', 'hostinger'];
 export const TRACKING_LABEL = { webhook: 'Webhook', imap: 'IMAP', pop3: 'POP3', mailapi: 'Mail API', hostinger: 'Hostinger' };
 
 const HOSTINGER_API = 'https://api.mail.hostinger.com';
@@ -42,6 +45,26 @@ const testWebhook = cfg => {
   return { ok: true, secret, detail: 'Signature verified — events signed with this secret will be accepted by the inbound webhook endpoint.' };
 };
 
+/** imapflow hides the server's real answer inside "Command failed" — dig it out. */
+const imapReason = e => {
+  for (const c of [e?.responseText, e?.text, e?.serverResponseCode, e?.response]) {
+    const s = String(c || '').trim();
+    if (s && s.length > 2 && !/^(NO|BAD|OK|PREAUTH)$/i.test(s)) return s;
+  }
+  return String(e?.message || e);
+};
+
+/** Turn the failure into an actionable sentence (the usual causes, in order). */
+const imapHint = e => {
+  const code = String(e?.code || '');
+  const all = `${code} ${e?.message || ''}`;
+  if (['ENOTFOUND', 'EAI_AGAIN'].includes(code)) return 'DNS lookup failed — check the IMAP host spelling (e.g. imap.hostinger.com).';
+  if (code === 'ECONNREFUSED') return 'connection refused — check host and port (IMAP is usually 993 with TLS).';
+  if (code === 'ETIMEDOUT' || code === 'EHOSTUNREACH') return 'connection timed out — the host/port is unreachable or blocked.';
+  if (/CERT|SSL|TLS|SELF_SIGNED/i.test(all)) return 'TLS/certificate error — use port 993 with TLS enabled.';
+  return 'Check: IMAP host (e.g. imap.hostinger.com), port 993 + TLS, username = full email address, the MAILBOX password (set in the email panel — NOT the hosting/account password), and IMAP enabled for this mailbox.';
+};
+
 const testImap = async cfg => {
   const host = String(cfg?.host || '').trim();
   const user = String(cfg?.user || '').trim();
@@ -53,14 +76,15 @@ const testImap = async cfg => {
   catch { throw badRequest('IMAP client is not installed on the server.'); }
   const client = new ImapFlow({
     host, port, secure: cfg?.secure ?? (port === 993),
-    auth: { user, pass }, logger: 0, timeout: 9000
+    auth: { user, pass }, logger: 0, timeout: 12000
   });
   try {
     await client.connect();
-    await client.logout();
   } catch (e) {
-    throw badRequest(`IMAP test failed — ${bounded(e?.message || e)}`);
+    throw badRequest(`IMAP test failed — ${bounded(imapReason(e))} · ${imapHint(e)}`);
   }
+  // The login already proved the channel — a failing logout must not fail the test.
+  try { await client.logout(); } catch { /* best effort */ }
   return { ok: true, detail: `IMAP login verified on ${host}:${port}.` };
 };
 
@@ -231,8 +255,8 @@ const testHostinger = async (cfg = {}) => {
 
 /** Run the live test for a channel. Throws badRequest with the exact reason. */
 export const testTrackingChannel = async (channel, cfg = {}) => {
-  if (!TRACKING_METHODS.includes(channel)) {
-    throw badRequest('Choose how this mailbox reports events — Webhook, IMAP, POP3, Mail API or Hostinger (at least one). It is tested before the mailbox is added.');
+  if (!TRACKING_METHODS.includes(channel) && !LEGACY_TRACKING_METHODS.includes(channel)) {
+    throw badRequest('Choose how this mailbox reports events — IMAP, POP3 or Mail API (at least one). It is tested before the mailbox is added.');
   }
   if (channel === 'webhook') return testWebhook(cfg);
   if (channel === 'imap') return testImap(cfg);

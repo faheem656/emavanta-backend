@@ -59,5 +59,6 @@ export const ROTATION = Object.freeze({
 
 export const QUEUE_NAMES = Object.freeze([
   'outbox', 'campaign', 'campaign_intake', 'outreach', 'marketing', 'transactional',
-  'webhook', 'webhook_out', 'contact_mail', 'analytics', 'report', 'import', 'billing', 'scheduler', 'reconcile', 'automation'
+  'webhook', 'webhook_out', 'contact_mail', 'analytics', 'report', 'import', 'billing', 'scheduler', 'reconcile', 'automation',
+  'verify'
 ]);

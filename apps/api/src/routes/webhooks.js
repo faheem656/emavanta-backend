@@ -23,8 +23,19 @@ export default async function webhookRoutes(app) {
   const needMailboxPath = async () => {
     throw badRequest('This URL cannot receive events. Use POST /api/v1/webhooks/mailbox/:accountId — copy the exact Webhook URL from the mailbox row (Webhook URL button). Provider-wide events: POST /api/v1/webhooks/provider/:provider.');
   };
+  const needAccountId = async () => {
+    throw badRequest('Missing mailbox id. Use POST /api/v1/webhooks/mailbox/:accountId — copy the exact Webhook URL from the mailbox row (Webhook URL button).');
+  };
   app.get('/webhooks', needMailboxPath);
   app.post('/webhooks', needMailboxPath);
+  // Humans open these URLs in a browser (GET) and used to see a bare
+  // NOT_FOUND — answer them instead. Deliveries are POSTs; GET is info only.
+  app.get('/webhooks/mailbox', needAccountId);
+  app.post('/webhooks/mailbox', needAccountId);
+  app.get('/webhooks/mailbox/:accountId', async req => ({
+    ok: true, endpoint: 'ready', accountId: req.params.accountId, accepts: 'POST',
+    note: 'This endpoint accepts POST deliveries authenticated with Authorization: Bearer <secret> or x-webhook-signature (HMAC-SHA256 hex). This GET is only an info page — trigger the test from your provider, not the browser.'
+  }));
 
   /**
    * Per-mailbox inbound webhook: the provider POSTs signed events here

@@ -216,7 +216,10 @@ const matchesField = (value, cond) => {
 };
 
 const matches = (doc, filter = {}) =>
-  Object.entries(filter).every(([k, v]) => k === '$or' ? v.some(f => matches(doc, f)) : matchesField(k.split('.').reduce((o, p) => o?.[p], doc), v));
+  Object.entries(filter).every(([k, v]) =>
+    k === '$or' ? v.some(f => matches(doc, f))
+      : k === '$and' ? v.every(f => matches(doc, f))
+        : matchesField(k.split('.').reduce((o, p) => o?.[p], doc), v));
 
 const setPath = (doc, key, value) => {
   if (!key.includes('.')) { doc[key] = value; return; }
@@ -333,7 +336,7 @@ const ensured = new Set();
  */
 const INDEXES = {
   organizations: [[{ planChangeSource: 1, planExpiresAt: 1 }]],
-  contacts: [[{ organizationId: 1, listIds: 1 }], [{ organizationId: 1, email: 1 }]],
+  contacts: [[{ organizationId: 1, listIds: 1 }], [{ organizationId: 1, email: 1 }], [{ organizationId: 1, 'verification.status': 1 }]],
   campaign_recipients: [[{ organizationId: 1, campaignId: 1, status: 1 }], [{ campaignId: 1, contactId: 1 }], [{ organizationId: 1, campaignId: 1, status: 1, sendingStartedAt: 1 }]],
   campaign_batches: [[{ campaignId: 1, status: 1, index: 1 }]],
   campaign_chunks: [[{ organizationId: 1, campaignId: 1, offset: 1 }]],
@@ -344,7 +347,10 @@ const INDEXES = {
   sequence_step_runs: [[{ organizationId: 1, enrollmentId: 1, stepIndex: 1 }]],
   sessions: [[{ organizationId: 1, status: 1 }], [{ 'token.jti': 1 }]],
   sending_accounts: [[{ organizationId: 1, status: 1 }], [{ status: 1, 'tracking.status': 1, 'tracking.method': 1 }]],
-  usage_counters: [[{ organizationId: 1, cycle: 1 }]]
+  usage_counters: [[{ organizationId: 1, cycle: 1 }]],
+  // Verification knowledge base (GLOBAL — one verification serves every tenant):
+  email_verifications: [[{ emailNormalized: 1 }], [{ status: 1, expiresAt: 1 }]],
+  email_domain_checks: [[{ domain: 1 }]]
 };
 
 const ensureIndex = name => {

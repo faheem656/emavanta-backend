@@ -55,7 +55,10 @@ const priceFor = ({ kind, plan, code, quantity = 1, interval = 'monthly' }) => {
   return { amount: addon.price * qty, currency: 'usd', interval: 'month',
     label: qty > 1 ? `${addon.label || addon.code} × ${qty}` : (addon.label || addon.code),
     title: addon.label || addon.code,
-    description: `${addon.label || addon.code} × ${qty} · one-month term, no automatic renewal`, quantity: qty };
+    description: addon.oneTime
+      ? `${addon.label || addon.code} × ${qty} · one-time purchase, credits never expire`
+      : `${addon.label || addon.code} × ${qty} · one-month term, no automatic renewal`,
+    quantity: qty };
 };
 
 /**
@@ -208,11 +211,19 @@ export default async function billingRoutes(app) {
     const org = await getOrg(req.ctx);
     let nextPlan = org.plan;
     let nextAddons = { ...(org.addons || {}) };
+    let nextVerifyCredits = Number(org.verifyCredits || 0);
     if (session.kind === 'plan') {
       if (!PLANS[session.plan]) throw badRequest('Unknown plan');
       nextPlan = session.plan;
     } else {
-      nextAddons[session.code] = (nextAddons[session.code] || 0) + (session.quantity || 1);
+      const addonDef = ADDONS[session.code];
+      if (addonDef?.grants === 'verifyCredits') {
+        // Verification credit PACKS: one-time lifetime balance only — they must
+        // NOT enter org.addons (that path feeds monthly limit math).
+        nextVerifyCredits += addonDef.amount * (session.quantity || 1);
+      } else {
+        nextAddons[session.code] = (nextAddons[session.code] || 0) + (session.quantity || 1);
+      }
     }
 
     const invoiceSeq = (await scoped('invoices', req.ctx).countDocuments({})) + 1;
@@ -224,7 +235,7 @@ export default async function billingRoutes(app) {
     });
 
     await collection('organizations').updateOne({ _id: req.ctx.organizationId },
-      { $set: { plan: nextPlan, addons: nextAddons, lastPaymentAt: charge.paidAt } });
+      { $set: { plan: nextPlan, addons: nextAddons, verifyCredits: nextVerifyCredits, lastPaymentAt: charge.paidAt } });
     await scoped('payment_sessions', req.ctx).updateOne({ _id: session._id },
       { $set: { status: 'paid', paidAt: charge.paidAt, invoiceId: invoice._id, card: methodLabel } });
     await audit(req.ctx, 'billing.paid', 'invoice', { invoice: invoice.number, amount: session.amount,
@@ -356,12 +367,21 @@ export default async function billingRoutes(app) {
 
   app.get('/billing/usage', async req => {
     const org = await getOrg(req.ctx);
+    const counter = await collection('usage_counters').findOne({ _id: `${req.ctx.organizationId}:${org.cycle}` });
+    const planAllowance = Number(PLANS[org.plan]?.limits?.verification_credits ?? 0);
+    const cycleUsed = Number(counter?.verification_credits || 0);
     return { cycle: org.cycle, plan: org.plan, addons: effectiveAddons(org),
       limits: limitsFor(org.plan, effectiveAddons(org)),
-      used: { sends: Math.max(Number((await collection('usage_counters').findOne({ _id: `${req.ctx.organizationId}:${org.cycle}` }))?.sends || 0),
+      used: { sends: Math.max(Number(counter?.sends || 0),
           await scoped('messages', req.ctx).countDocuments({})),
         contacts: await scoped('contacts', req.ctx).countDocuments({ deleted: { $ne: true } }),
-        seats: await scoped('memberships', req.ctx).countDocuments({ status: 'active' }) } };
+        seats: await scoped('memberships', req.ctx).countDocuments({ status: 'active' }),
+        verification_credits: cycleUsed },
+      verification: {
+        planAllowance, cycleUsed,
+        planRemaining: planAllowance === -1 ? -1 : Math.max(0, planAllowance - cycleUsed),
+        packBalance: Number(org.verifyCredits || 0)
+      } };
   });
 
   /** What the demo install accepts, so the checkout form can say it plainly. */

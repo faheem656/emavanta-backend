@@ -195,7 +195,12 @@ export async function reviewCrypto({txHash, ownerId}) {
       amount:row.amount,currency:'usd',description,status:'paid',method:'USDT BEP-20',txHash,date:now.toISOString().slice(0,10),paidAt:now.toISOString(),createdAt:now.toISOString()},{session});
     if(isAddon){
       await database.collection('crypto_addon_grants').insertOne({_id:txHash,organizationId:row.organizationId,code:row.code,quantity:row.quantity,status:'active',startsAt:now.toISOString(),expiresAt:end.toISOString()},{session});
-      await orgs.updateOne({_id:row.organizationId},{$inc:{[`cryptoAddons.${row.code}`]:row.quantity},$set:{lastPaymentAt:now.toISOString()}},{session});
+      // Verification credit PACKS grant a one-time lifetime balance — they must
+      // NOT go through cryptoAddons (that path is monthly/expiring by design).
+      const packGrant = ADDONS[row.code]?.grants === 'verifyCredits' ? ADDONS[row.code].amount * row.quantity : 0;
+      await orgs.updateOne({_id:row.organizationId}, packGrant
+        ? {$inc:{verifyCredits: packGrant},$set:{lastPaymentAt:now.toISOString()}}
+        : {$inc:{[`cryptoAddons.${row.code}`]:row.quantity},$set:{lastPaymentAt:now.toISOString()}},{session});
     }else await orgs.updateOne({_id:row.organizationId},{$set:{plan:row.plan,planChangeSource:'crypto',planExpiresAt:end.toISOString(),planStartedAt:(org.plan===row.plan && ['crypto','stripe'].includes(org.planChangeSource) && Date.parse(org.planExpiresAt)>now.getTime() ? (org.planStartedAt || null) : now.toISOString()),planInterval:row.interval,lastPaymentAt:now.toISOString()}},{session});
     const updatedOrder=await orders.updateOne({_id:row.orderId,organizationId:row.organizationId,status:'crypto_submitted'},{$set:{status:'paid',invoiceId,paidAt:now.toISOString()}},{session});
     if(!updatedOrder.matchedCount)throw conflict('Order changed; no payment was applied.');

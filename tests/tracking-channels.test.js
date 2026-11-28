@@ -12,7 +12,7 @@ import { scoped, collection } from '../packages/database/store.js';
 import { hasPendingJob, closeQueues } from '../packages/queue/index.js';
 
 test('channel tests reject bad input before any network call', async () => {
-  await assert.rejects(() => testTrackingChannel('carrier-pigeon', {}), /Webhook, IMAP, POP3, Mail API or Hostinger/);
+  await assert.rejects(() => testTrackingChannel('carrier-pigeon', {}), /IMAP, POP3 or Mail API/);
   await assert.rejects(() => testTrackingChannel('webhook', { secret: 'short' }), /at least 16 characters/);
   await assert.rejects(() => testTrackingChannel('imap', {}), /host, username and password/);
   await assert.rejects(() => testTrackingChannel('pop3', { host: 'x' }), /host, username and password/);
@@ -23,7 +23,9 @@ test('channel tests reject bad input before any network call', async () => {
   await assert.rejects(() => testTrackingChannel('hostinger', {}), /Mail API token/);
   await assert.rejects(() => testTrackingChannel('hostinger', { token: 't'.repeat(20) }), /mailbox id missing/);
   await assert.rejects(() => testTrackingChannel('hostinger', { token: 't'.repeat(20), accountId: 'acc-test-123' }), /public HTTPS/);
-  assert.deepEqual([...TRACKING_METHODS], ['webhook', 'imap', 'pop3', 'mailapi', 'hostinger']);
+  // New mailboxes only get IMAP/POP3/Mail API — webhook + Hostinger are legacy
+  // (still testable for stored accounts, hidden from selection).
+  assert.deepEqual([...TRACKING_METHODS], ['imap', 'pop3', 'mailapi']);
 });
 
 test('webhook channel test = real sign → verify round-trip', async () => {
@@ -184,6 +186,20 @@ test('webhook URLs are public — the session guard never401s them', async () =>
   assert.notEqual(mb.statusCode, 401);
   assert.equal(mb.statusCode, 400);
   assert.match(JSON.parse(mb.body).error.message, /not configured/);
+
+  // Browser GETs must never show a bare NOT_FOUND: full URL → friendly info page,
+  // incomplete URLs → exact guidance.
+  const info = await app.inject({ method: 'GET', url: '/api/v1/webhooks/mailbox/acc-x' });
+  assert.equal(info.statusCode, 200);
+  const infoBody = JSON.parse(info.body);
+  assert.equal(infoBody.accepts, 'POST');
+  assert.match(infoBody.note, /POST/);
+  const noId = await app.inject({ method: 'GET', url: '/api/v1/webhooks/mailbox' });
+  assert.equal(noId.statusCode, 400);
+  assert.match(JSON.parse(noId.body).error.message, /mailbox\/:accountId/);
+  const postNoId = await app.inject({ method: 'POST', url: '/api/v1/webhooks/mailbox',
+    headers: { 'content-type': 'application/json' }, payload: '{}' });
+  assert.equal(postNoId.statusCode, 400);
 
   await app.close();
   await closeQueues();

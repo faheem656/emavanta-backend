@@ -2,6 +2,7 @@ import { collection, scoped } from '../../../../packages/database/store.js';
 import { registerWorker } from '../../../../packages/queue/index.js';
 import { newId } from '../../../../packages/shared/utils.js';
 import { classifyEvent, bumpBounceWindow } from '../../../../packages/deliverability/index.js';
+import { VERIFICATION_VERSION } from '../../../../packages/email-verification/index.js';
 import { guardBounceRate } from './campaignRunner.js';
 
 const classify = e => {
@@ -56,8 +57,13 @@ export const startWebhookProcessor = () => registerWorker('webhook', async ({ pr
   if (type === 'bounced' && email) {
     // The CONTACT flips to bounced too — visible on the contacts page (the
     // unsubscribe status is the stronger user signal and is never overwritten).
+    // The verification verdict flips with it: a bounced address is INVALID no
+    // matter what an earlier check said (bounce history beats DNS/SMTP).
     await scoped('contacts', ctx).updateOne({ email, status: { $ne: 'unsubscribed' } },
-      { $set: { status: 'bounced', bouncedAt: new Date().toISOString() } });
+      { $set: { status: 'bounced', bouncedAt: new Date().toISOString(),
+        verification: { status: 'INVALID', reason: 'bounced', confidence: 'high',
+          riskFlags: ['bounced_after_send'], verifiedAt: new Date().toISOString(),
+          version: VERIFICATION_VERSION } } });
   }
   if (type === 'bounced' && sendingAccountId) {
     // Per-mailbox bounce ledger: providers hard-block around 5 bounces/hour, so we

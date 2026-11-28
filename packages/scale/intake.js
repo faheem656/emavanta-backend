@@ -17,6 +17,7 @@ import { writeWithOutbox } from '../database/outbox.js';
 import { streamConfig } from '../deliverability/index.js';
 import { newId } from '../shared/utils.js';
 import { getQueue } from '../queue/index.js';
+import { verificationGate } from '../email-verification/index.js';
 
 export const INTAKE_CHUNK = Math.max(200, Number(process.env.INTAKE_CHUNK || 2000));
 
@@ -63,11 +64,17 @@ export const intakeChunk = async ({
     if (ct.status === 'unsubscribed') return 'unsubscribed';
     if (ct.status === 'bounced') return 'already_bounced';
     const sup = supByEmail.get(String(ct.email || '').toLowerCase().trim());
-    if (!sup) return null;
-    const r = String(sup.reason || '').toLowerCase();
-    if (r.includes('unsub')) return 'unsubscribed';
-    if (r.includes('bounc')) return 'already_bounced';
-    return 'suppressed';
+    if (sup) {
+      const r = String(sup.reason || '').toLowerCase();
+      if (r.includes('unsub')) return 'unsubscribed';
+      if (r.includes('bounc')) return 'already_bounced';
+      return 'suppressed';
+    }
+    // Verification gate (DB-first): INVALID blocks, PENDING waits, UNKNOWN /
+    // CATCH_ALL hold per campaign policy — never silently sent (plan rule).
+    const gate = verificationGate(ct, sendPolicy);
+    if (gate) return gate.reason;
+    return null;
   };
   const recipients = contacts.map(ct => {
     const reason = skipReasonFor(ct);

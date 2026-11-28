@@ -107,7 +107,7 @@ export default async function accountRoutes(app) {
     // if the test fails, the account is NOT added.
     const trackingMethod = String(req.body?.tracking?.method || '').toLowerCase();
     if (!TRACKING_METHODS.includes(trackingMethod)) {
-      throw badRequest('Choose how this mailbox reports bounces — Webhook, IMAP, POP3, Mail API or Hostinger (at least one). It is tested before the mailbox is added.');
+      throw badRequest('Choose how this mailbox reports bounces — IMAP, POP3 or Mail API (at least one). It is tested before the mailbox is added.');
     }
     const accountId = newId();
     const trackingCfg = { ...(req.body?.tracking || {}) };
@@ -182,7 +182,13 @@ export default async function accountRoutes(app) {
     const acc = await scoped('sending_accounts', req.ctx).findOne({ _id: req.params.id });
     if (!acc || !canAccessWorkspace(req.ctx, acc.workspaceId)) throw notFound('Account not found');
     const method = String(req.body?.tracking?.method || '').toLowerCase();
-    if (!TRACKING_METHODS.includes(method)) throw badRequest('Unknown tracking channel.');
+    // New channels: IMAP/POP3/Mail API. A mailbox already on webhook/Hostinger
+    // may KEEP and re-configure its own legacy channel (in-place only — you can
+    // switch away from legacy, never onto it).
+    const keepLegacy = (acc.tracking?.method === method) && (method === 'webhook' || method === 'hostinger');
+    if (!TRACKING_METHODS.includes(method) && !keepLegacy) {
+      throw badRequest('Unknown tracking channel. Choose IMAP, POP3 or Mail API.');
+    }
     const cfg = { ...(req.body?.tracking || {}) };
     delete cfg.method;
     cfg.accountId = acc._id;

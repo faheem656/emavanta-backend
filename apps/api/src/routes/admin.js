@@ -77,6 +77,7 @@ export default async function adminRoutes(app) {
       const owner = org.ownerId ? await collection('users').findOne({ _id: org.ownerId }) : null;
       const invoices = await collection('invoices').find({ organizationId: org._id }, { sort: { createdAt: -1 }, limit: 5 });
       return { id: org._id, name: org.name, plan: org.plan || 'free', status: org.status || 'active', planSource:org.planChangeSource || null, planStartedAt:org.planStartedAt || null, planExpiresAt:org.planExpiresAt || null,
+        verifyCredits: Number(org.verifyCredits || 0),
         owner: owner ? { name: owner.name, email: owner.email, emailVerified: owner.emailVerified === true } : null,
         invoices: invoices.map(i => ({ number:i.number, amount:i.amount, currency:i.currency, status:i.status, method:i.method, date:i.date })) };
     }));
@@ -145,6 +146,36 @@ export default async function adminRoutes(app) {
       await db.collection('platform_admin_events').insertOne({_id:newId(),actorId:req.ctx.user.id,targetOrganizationId:org._id,type:'manual_plan_override',from:expectedPlan,to:plan,reason,status:'applied',startedAt,expiresAt,interval,createdAt:now.toISOString()},{session});
       return {ok:true,plan,startedAt,expiresAt,interval,message:'Manual plan term saved. No payment was recorded and no automatic renewal was scheduled.'};
     });
+  });
+
+  // Verification credits are PACKS ONLY — no plan includes any. The platform
+  // owner can grant or set a workspace's one-time balance (never expires);
+  // every change is audited like a manual plan override.
+  app.post('/admin/workspaces/:id/verification-credits', async req => {
+    await assertAdmin(req.ctx);
+    const action = String(req.body?.action || '');
+    const amount = Number(req.body?.amount);
+    const reason = String(req.body?.reason || '').trim();
+    if (!['grant', 'set'].includes(action)) throw badRequest('Choose grant (add credits) or set (replace balance).');
+    if (!Number.isSafeInteger(amount) || amount < 0 || amount > 10000000) throw badRequest('Enter a whole number of credits between 0 and 10,000,000.');
+    if (reason.length < 10 || reason.length > 500) throw badRequest('Explain the reason in 10–500 characters.');
+    const org = await collection('organizations').findOne({ _id: req.params.id });
+    if (!org) throw notFound('Workspace not found.');
+    const from = Number(org.verifyCredits || 0);
+    const to = action === 'grant' ? from + amount : amount;
+    if (to > 100000000) throw badRequest('Balance would exceed 100,000,000 credits.');
+    await collection('organizations').updateOne({ _id: org._id }, { $set: { verifyCredits: to } });
+    try {
+      await collection('platform_admin_events').insertOne({
+        _id: newId(), actorId: req.ctx.user.id, targetOrganizationId: org._id,
+        type: 'verification_credits', action, from, to, amount, reason,
+        status: 'applied', createdAt: new Date().toISOString()
+      });
+    } catch { /* audit is best-effort outside transactions */ }
+    return { ok: true, balance: to, from, to,
+      message: action === 'grant'
+        ? `Granted ${amount} verification credits to ${org.name} (balance ${to}).`
+        : `Set ${org.name} verification credits to ${to}.` };
   });
 
   app.get('/admin/overview', async req => {

@@ -6,6 +6,7 @@ import { startWebhookProcessor } from './webhookProcessor.js';
 import { startContactMailWorker } from './contactMail.js';
 import { startOtherWorkers } from './otherWorkers.js';
 import { startAutomationRunner } from './automationRunner.js';
+import { startEmailVerificationWorker } from './emailVerificationWorker.js';
 
 export const startWorkers = () => {
   startOutboxRelay();
@@ -16,5 +17,6 @@ export const startWorkers = () => {
   startOutreachPacer();
   startWebhookProcessor();
   startOtherWorkers();
-  console.log('[workers] registered: outbox, campaign, intake, outreach, automation, webhook, webhook_out, import, analytics, scheduler, billing, report, reconcile');
+  startEmailVerificationWorker();
+  console.log('[workers] registered: outbox, campaign, intake, outreach, automation, webhook, webhook_out, import, analytics, scheduler, billing, report, reconcile, verify');
 };

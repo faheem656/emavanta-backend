@@ -2,6 +2,7 @@ import { collection, scoped, isMemoryMode } from '../../../../packages/database/
 import { registerWorker, getQueue, hasPendingJob } from '../../../../packages/queue/index.js';
 import { selectAccount } from '../../../../packages/email-engine/selection.js';
 import { renderMessage } from '../../../../packages/email-engine/render.js';
+import { VERIFICATION_VERSION } from '../../../../packages/email-verification/index.js';
 import { sendMessage } from '../../../../packages/providers/index.js';
 import { acquireStream } from '../../../../packages/rate-limiter/index.js';
 import { streamConfig, throughputFor, cooldownUntil, classifySendError, bumpBounceWindow, BOUNCE_PAUSE } from '../../../../packages/deliverability/index.js';
@@ -9,6 +10,7 @@ import { newId } from '../../../../packages/shared/utils.js';
 import { expireCryptoSubscription } from '../payments/crypto-service.js';
 import { whiteLabelFor } from '../../../../packages/entitlements/branding.js';
 import { pacingFor, isWithinWindow, nextSendAt } from '../../../../packages/email-engine/cadence.js';
+import { verificationGate } from '../../../../packages/email-verification/index.js';
 
 const domainOf = account => String(account.fromEmail || '').split('@')[1] || 'unknown';
 
@@ -73,6 +75,15 @@ export const deliverOne = async ({ organizationId, campaignId, recipientId, acco
     ...(recipient.contactId ? [{ _id: recipient.contactId }] : []),
     { email: recipient.email }
   ] });
+  // Final verification gate — bypass-proof: even if a recipient slipped past
+  // intake (paused→relaunch, API injection), INVALID never sends, PENDING waits,
+  // UNKNOWN/CATCH_ALL hold per campaign policy (one policy engine: policy.js).
+  const vGate = verificationGate(contact, effectiveSendPolicy);
+  if (vGate) {
+    await scoped('campaign_recipients', ctx).updateOne({ _id: recipientId, status: 'queued' },
+      { $set: { status: 'paused', reason: vGate.reason } });
+    return { skipped: true, reason: vGate.reason };
+  }
   const message = renderMessage({ template, recipient, account, campaign, organizationId, includeEmavantaBrand: !whiteLabelFor(org), tokenFallbacks, contact });
   // Atomic claim stops concurrent workers from sending the same queued recipient.
   const claim=await scoped('campaign_recipients', ctx).updateOne({ _id: recipientId, status:'queued' }, { $set: { status:'sending', sendingStartedAt:new Date().toISOString() } });
@@ -119,8 +130,12 @@ export const deliverOne = async ({ organizationId, campaignId, recipientId, acco
       }
       if (email) {
         // The CONTACT flips too (unsubscribe is the stronger signal and wins).
+        // The verification verdict flips with it — bounce history beats any
+        // earlier DNS/SMTP "valid" (free protection, never re-sends).
         await scoped('contacts', ctx).updateOne({ email, status: { $ne: 'unsubscribed' } },
-          { $set: { status: 'bounced', bouncedAt: at } });
+          { $set: { status: 'bounced', bouncedAt: at,
+            verification: { status: 'INVALID', reason: 'bounced', confidence: 'high',
+              riskFlags: ['bounced_after_send'], verifiedAt: at, version: VERIFICATION_VERSION } } });
       }
       await collection('delivery_events').create({ _id: newId(), organizationId, campaignId,
         contactId: recipient.contactId || recipient._id, email, sendingAccountId: account._id,

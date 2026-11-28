@@ -18,7 +18,21 @@ export const startOtherWorkers = () => {
       if(parsed.success)valid.push({ ...parsed.data, consentSource: 'import', consentIp });
     }
     let created=0;
-    for(let i=0;i<valid.length;i+=10000){const result=await createContacts(ctx,valid.slice(i,i+10000));created+=result.created.length;}
+    const freshRows = [];
+    for(let i=0;i<valid.length;i+=10000){const result=await createContacts(ctx,valid.slice(i,i+10000));created+=result.created.length;freshRows.push(...result.created);}
+    // Auto-verify: every NEW contact is marked PENDING immediately (the send gate
+    // holds it from second zero) and queued for the DB-first verification worker.
+    if (freshRows.length) {
+      const { enqueueVerification } = await import('./emailVerificationWorker.js');
+      const nowIso = new Date().toISOString();
+      for (const c of freshRows) {
+        const em = String(c.email || '').toLowerCase().trim();
+        if (!em) continue;
+        await scoped('contacts', ctx).updateOne({ _id: c._id },
+          { $set: { verification: { status: 'PENDING', reason: 'queued', queuedAt: nowIso, version: 1 } } });
+        await enqueueVerification({ organizationId, email: em, contactId: c._id, source: 'import' });
+      }
+    }
     console.log(`[import] ${created}/${rows.length} contacts imported`);
   });
 
